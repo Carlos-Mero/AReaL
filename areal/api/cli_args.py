@@ -702,7 +702,7 @@ class PPOActorConfig(TrainEngineConfig):
         default="token",
         metadata={
             "help": "Level at which to compute importance sampling ratios. 'token': per-token ratios (standard PPO). 'sequence': sequence-level geometric mean of per-token ratios (GSPO).",
-            "choices": ["token", "sequence"],
+            "choices": ["token", "sequence", "s_1", "g_0", "g_1", "g_2"],
         },
     )
     # Proximal Log-Probability Computation Method

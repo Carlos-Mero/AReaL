@@ -1,4 +1,4 @@
-experiment_name: gsm8k-drgrpo
+experiment_name: gsm8k-gspo
 trial_name: trial0
 
 seed: 1
@@ -66,10 +66,13 @@ actor:
   reward_norm:
     mean_level: group
     std_level: null
+    mean_leave1out: true
     group_size: ${gconfig.n_samples}
   adv_norm:
     mean_level: batch
     std_level: batch
+  # GSPO: Use sequence-level importance sampling (geometric mean of per-token ratios)
+  importance_sampling_level: s_1
 
 ref:
   experiment_name: ${experiment_name}
