@@ -196,6 +196,18 @@ def ppo_actor_loss_fn(
         1.0 - eps_clip,
         1.0 + (eps_clip if eps_clip_higher is None else eps_clip_higher),
     )
+    pg_loss1 = -advantages * ratio
+    pg_loss2 = -advantages * clipped_ratio
+    clip_mask = pg_loss1.detach() < pg_loss2.detach()
+    pg_loss = torch.max(pg_loss1, pg_loss2)
+    if c_clip is not None:
+        assert c_clip > 1.0, c_clip
+        pg_loss3 = torch.sign(advantages) * c_clip * advantages
+        dual_clip_mask = pg_loss3.detach() < pg_loss.detach()
+        pg_loss = torch.min(pg_loss, pg_loss3)
+    else:
+        dual_clip_mask = torch.zeros_like(clip_mask)
+
     behav_kl = proximal_logprobs - old_logprobs
     behav_imp_weight = behav_kl.exp()
     behav_mask = (
@@ -206,36 +218,24 @@ def ppo_actor_loss_fn(
     behav_kl = torch.where(behav_mask, behav_kl, 0.0)
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     if importance_sampling_level == "sequence" or importance_sampling_level == "token":
-        pg_loss1 = -advantages * ratio
-        pg_loss2 = -advantages * clipped_ratio
-        clip_mask = pg_loss1.detach() < pg_loss2.detach()
-        pg_loss = torch.max(pg_loss1, pg_loss2)
-        if c_clip is not None:
-            assert c_clip > 1.0, c_clip
-            pg_loss3 = torch.sign(advantages) * c_clip * advantages
-            dual_clip_mask = pg_loss3.detach() < pg_loss.detach()
-            pg_loss = torch.min(pg_loss, pg_loss3)
-        else:
-            dual_clip_mask = torch.zeros_like(clip_mask)
         pg_loss = pg_loss * behav_imp_weight
         logging_loss = pg_loss.detach()
         pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
     else:
         # IMPORTANT: ratio clip is disabled for these new methods currently
         batch_size = ratio.size(0) if ratio.dim() == 2 else 1
-        behav_imp_approx = 1.0 + (torch.where(loss_mask, behav_imp_weight - 1.0, 0).sum(dim=1))
+        behav_imp_approx = 1.0 + (torch.where(loss_mask, behav_imp_weight - 1.0, 0).sum(dim=-1))
         ratio_delta = torch.where(loss_mask, ratio - 1.0, 0)
         if importance_sampling_level == "g_2":
             Sigma_1 = torch.where(loss_mask, ratio_delta, 0).sum(dim=1)
-            sum_sq_delta = torch.where(loss_mask, ratio_delta * ratio_delta, 0).sum(dim=1)
+            sum_sq_delta = torch.where(loss_mask, ratio_delta * ratio_delta, 0).sum(dim=-1)
             # sum_(1 <= i < j <= N) delta_i delta_j = (Sigma_1^2 - sum_(i=1)^N delta_i^2) / 2
             Sigma_2 = (Sigma_1 * Sigma_1 - sum_sq_delta) / 2
             ratio = 1.0 + Sigma_1 + Sigma_2
         else:
-            ratio = 1.0 + (torch.where(loss_mask, ratio_delta, 0).sum(dim=1))
-        advantages = (advantages.sum(dim=-1, keepdim=True) / seq_lengths).expand_as(
-            ratio
-        )
+            ratio = 1.0 + (torch.where(loss_mask, ratio_delta, 0).sum(dim=-1))
+        seq_lengths = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+        advantages = advantages.sum(dim=-1, keepdim=True) / seq_lengths
         pg_loss = -ratio * advantages
         pg_loss = (pg_loss * behav_imp_approx).sum() / batch_size
         logging_loss = pg_loss.detach()
