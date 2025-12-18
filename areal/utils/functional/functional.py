@@ -221,6 +221,13 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behav_imp_weight
         logging_loss = pg_loss.detach()
         pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    elif importance_sampling_level == "s_1":
+        seq_behav_imp_weight, _ = _compute_sequence_level_ratio_and_advantages(
+            log_ratio, advantages, behav_mask, cu_seqlens
+        )
+        pg_loss = pg_loss * seq_behav_imp_weight
+        logging_loss = pg_loss.detach()
+        pg_loss = (torch.where(loss_mask, pg_loss, 0).sum()) / (cu_seqlens.size(0) - 1)
     else:
         # IMPORTANT: ratio clip is disabled for these new methods currently
         batch_size = ratio.size(0) if ratio.dim() == 2 else 1
