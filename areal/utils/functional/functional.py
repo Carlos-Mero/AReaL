@@ -141,6 +141,76 @@ def _compute_sequence_level_ratio_and_advantages(
 
     return ratio, advantages
 
+def _compute_lse_normal_approx_loss(
+    log_ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Args:
+        log_ratio: Log of probability ratios (logprobs - proximal_logprobs)
+        advantages: Per-token advantages
+        loss_mask: Boolean mask indicating valid tokens
+        cu_seqlens: Cumulative sequence lengths. Required for 1D tensors (packed format).
+            Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
+            For a single sequence, use cu_seqlens=torch.tensor([0, seq_len]).
+
+    Returns:
+        loss: the average loss computed via log-space normal estimation method
+    """
+    # Handle only 1D (packed) tensor shapes
+    if log_ratio.ndim != 1:
+        raise NotImplementedError("2D (padded) tensor handling logic for lse is not implemented yet!")
+
+    batch_size = len(cu_seqlens) - 1
+    device = log_ratio.device
+    dtype = log_ratio.dtype
+
+    if batch_size < 2:
+        # Fallback for single sequence: no variance reduction possible via batch stats
+        # Create a dummy scalar that preserves the original values approximately or just detach
+        return torch.ones_like(log_ratio), advantages
+
+    # Batch Indices
+    # cu_seqlens: [0, s1, s1+s2, ...]
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    # batch_idx: [0, 0, ..., 1, 1, ..., B-1]
+    batch_idx = torch.repeat_interleave(
+        torch.arange(batch_size, device=device), 
+        seq_lens
+    )
+    
+    # Sequence-level Aggregation
+    # S_i = Sum(log_ratio) for sequence i
+    # A_i = Mean(advantages) for sequence i (weighted by mask)
+    S = torch.zeros(batch_size, device=device, dtype=dtype)
+    A_sum = torch.zeros(batch_size, device=device, dtype=dtype)
+    valid_counts = torch.zeros(batch_size, device=device, dtype=dtype)
+
+    S.index_add_(0, batch_idx, torch.where(loss_mask, log_ratio, 0.0))
+    A_sum.index_add_(0, batch_idx, torch.where(loss_mask, advantages, 0.0))
+    valid_counts.index_add_(0, batch_idx, loss_mask.to(dtype))
+
+    # Average advantage per sequence
+    # Clamp count to 1.0 just to avoid NaN, though valid sequences should have >0 tokens
+    A_seq = A_sum / valid_counts.clamp(min=1.0)
+
+    # Unbiased estimator for variance usually implies ddof=1
+    mu_S = torch.mean(S)
+    var_S = torch.var(S, unbiased=True)
+
+    # Covariance
+    cov_matrix = torch.cov(torch.stack([S, A_seq]))
+    cov_SA = cov_matrix[0, 1]
+    
+    # E[Product] = exp(mu + sigma^2 / 2)
+    estimated_ratio = torch.exp(mu_S + 0.5 * var_S)
+
+    # Adjusted Advantage
+    # Total Expectation ~ E[Product] * (E[A] + Cov(S,A))
+    estimated_adv = cov_SA
+    return estimated_ratio * estimated_adv
 
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
@@ -180,7 +250,7 @@ def ppo_actor_loss_fn(
         ratio, advantages = _compute_sequence_level_ratio_and_advantages(
             log_ratio, advantages, loss_mask, cu_seqlens
         )
-    elif importance_sampling_level == "token" or importance_sampling_level == "g_1" or importance_sampling_level == "g_2":
+    elif importance_sampling_level == "token" or importance_sampling_level == "g_1" or importance_sampling_level == "g_2" or importance_sampling_level == "lse":
         # Standard PPO: per-token ratio
         ratio = torch.where(loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
     elif importance_sampling_level == "g_0":
@@ -221,6 +291,11 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behav_imp_weight
         logging_loss = pg_loss.detach()
         pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    elif importance_sampling_level == "lse":
+        log_ratio = logprobs - old_logprobs
+        pg_loss = _compute_lse_normal_approx_loss(
+            log_ratio, advantages, loss_mask, cu_seqlens
+        )
     elif importance_sampling_level == "s_1":
         seq_behav_imp_weight, _ = _compute_sequence_level_ratio_and_advantages(
             behav_imp_weight, advantages, behav_mask, cu_seqlens
