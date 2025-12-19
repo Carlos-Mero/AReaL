@@ -224,8 +224,11 @@ def _compute_lse_normal_approx_loss(
 
     if batch_size < 2:
         # Fallback for single sequence: no variance reduction possible via batch stats
-        # Create a dummy scalar that preserves the original values approximately or just detach
-        return torch.ones_like(log_ratio)
+        # Use g_0 method instead
+        ratio = torch.where(loss_mask, torch.exp(log_ratio - log_ratio.detach()), 0.0)
+        loss_mask_count = loss_mask.count_nonzero() or 1
+        pg_loss = -advantages * ratio
+        return torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
 
     # Batch Indices
     # cu_seqlens: [0, s1, s1+s2, ...]
@@ -249,23 +252,27 @@ def _compute_lse_normal_approx_loss(
 
     # Average advantage per sequence
     # Clamp count to 1.0 just to avoid NaN, though valid sequences should have >0 tokens
-    A_seq = A_sum / valid_counts.clamp(min=1.0)
+    clamp_counts = valid_counts.clamp(min=1.0)
+    A_seq = A_sum / clamp_counts
 
     # Unbiased estimator for variance usually implies ddof=1
-    mu_S = torch.mean(S)
-    var_S = torch.var(S, unbiased=True)
+    total_tokens = valid_counts.sum()
+    mu_tok = S.sum() / total_tokens.clamp(min=1.0)
+    S_per_tok = S / clamp_counts
+    residuals = S_per_tok - mu_tok
+    weighted_rss = torch.sum(valid_counts * (residuals ** 2))
+    sigma2_tok = weighted_rss / (batch_size - 1)
+    S_centered = S - (valid_counts * mu_tok)
+    A_centered = A_seq - A_seq.mean()
+    cov_SA = (S_centered * A_centered).sum() / (batch_size - 1)
 
-    # Covariance
-    cov_matrix = torch.cov(torch.stack([S, A_seq]))
-    cov_SA = cov_matrix[0, 1]
+    exponent_term = valid_counts * mu_tok + 0.5 * valid_counts * sigma2_tok
+    expected_ratio_per_seq = torch.exp(exponent_term)
+    avg_expected_ratio = expected_ratio_per_seq.mean()
 
-    # E[Product] = exp(mu + sigma^2 / 2)
-    estimated_ratio = torch.exp(mu_S + 0.5 * var_S)
-
-    # Adjusted Advantage
-    # Total Expectation ~ E[Product] * (E[A] + Cov(S,A))
-    estimated_adv = cov_SA
-    return -estimated_ratio * estimated_adv
+    # Stein's Lemma / Gaussian Approximation: E[Ratio * A] ≈ E[Ratio] * Cov(S, A)
+    loss = -avg_expected_ratio * cov_SA
+    return loss
 
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
@@ -309,7 +316,7 @@ def ppo_actor_loss_fn(
         # Standard PPO: per-token ratio
         ratio = torch.where(loss_mask, torch.exp(logprobs - proximal_logprobs), 0)
     elif importance_sampling_level == "g_0":
-        ratio = torch.where(loss_mask, 1.0, 0.0)
+        ratio = torch.where(loss_mask, torch.exp(logprobs - logprobs.detach()), 0.0)
     else:
         raise ValueError(
             f"Invalid importance_sampling_level: {importance_sampling_level}. "
