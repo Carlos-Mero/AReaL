@@ -141,12 +141,67 @@ def _compute_sequence_level_ratio_and_advantages(
 
     return ratio, advantages
 
+def _compute_g_2_loss(
+    log_ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> torch.Tensor:
+    """
+    Args:
+        log_ratio: Log of probability ratios (logprobs - proximal_logprobs)
+        advantages: Per-token advantages
+        loss_mask: Boolean mask indicating valid tokens
+        cu_seqlens: Cumulative sequence lengths. Required for 1D tensors (packed format).
+            Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
+            For a single sequence, use cu_seqlens=torch.tensor([0, seq_len]).
+
+    Returns:
+        loss: the average loss computed via 2nd order grpo method
+    """
+    # Handle only 1D (packed) tensor shapes
+    if log_ratio.ndim != 1:
+        raise NotImplementedError("2D (padded) tensor handling logic for lse is not implemented yet!")
+
+    batch_size = len(cu_seqlens) - 1
+    device = log_ratio.device
+    dtype = log_ratio.dtype
+
+    # Batch Indices
+    # cu_seqlens: [0, s1, s1+s2, ...]
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    # batch_idx: [0, 0, ..., 1, 1, ..., B-1]
+    batch_idx = torch.repeat_interleave(
+        torch.arange(batch_size, device=device),
+        seq_lens
+    )
+
+    # Sequence-level Aggregation
+    # S_i = Sum(log_ratio) for sequence i
+    # A_i = Mean(advantages) for sequence i (weighted by mask)
+    S = torch.zeros(batch_size, device=device, dtype=dtype)
+    A_sum = torch.zeros(batch_size, device=device, dtype=dtype)
+    valid_counts = torch.zeros(batch_size, device=device, dtype=dtype)
+
+    S.index_add_(0, batch_idx, torch.where(loss_mask, log_ratio, 0.0))
+    A_sum.index_add_(0, batch_idx, torch.where(loss_mask, advantages, 0.0))
+    valid_counts.index_add_(0, batch_idx, loss_mask.to(dtype))
+
+    # Average advantage per sequence
+    # Clamp count to 1.0 just to avoid NaN, though valid sequences should have >0 tokens
+    A_seq = A_sum / valid_counts.clamp(min=1.0)
+
+    # Loss calculation
+    ratio_approx = 1.0 + S + 0.5 * S.pow(2)
+    loss = - (A_seq * ratio_approx).mean()
+    return loss
+
 def _compute_lse_normal_approx_loss(
     log_ratio: torch.Tensor,
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Args:
         log_ratio: Log of probability ratios (logprobs - proximal_logprobs)
@@ -170,17 +225,17 @@ def _compute_lse_normal_approx_loss(
     if batch_size < 2:
         # Fallback for single sequence: no variance reduction possible via batch stats
         # Create a dummy scalar that preserves the original values approximately or just detach
-        return torch.ones_like(log_ratio), advantages
+        return torch.ones_like(log_ratio)
 
     # Batch Indices
     # cu_seqlens: [0, s1, s1+s2, ...]
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     # batch_idx: [0, 0, ..., 1, 1, ..., B-1]
     batch_idx = torch.repeat_interleave(
-        torch.arange(batch_size, device=device), 
+        torch.arange(batch_size, device=device),
         seq_lens
     )
-    
+
     # Sequence-level Aggregation
     # S_i = Sum(log_ratio) for sequence i
     # A_i = Mean(advantages) for sequence i (weighted by mask)
@@ -203,14 +258,14 @@ def _compute_lse_normal_approx_loss(
     # Covariance
     cov_matrix = torch.cov(torch.stack([S, A_seq]))
     cov_SA = cov_matrix[0, 1]
-    
+
     # E[Product] = exp(mu + sigma^2 / 2)
     estimated_ratio = torch.exp(mu_S + 0.5 * var_S)
 
     # Adjusted Advantage
     # Total Expectation ~ E[Product] * (E[A] + Cov(S,A))
     estimated_adv = cov_SA
-    return estimated_ratio * estimated_adv
+    return -estimated_ratio * estimated_adv
 
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
@@ -293,16 +348,23 @@ def ppo_actor_loss_fn(
         pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
     elif importance_sampling_level == "lse":
         log_ratio = logprobs - old_logprobs
+        logging_loss = pg_loss.detach()
         pg_loss = _compute_lse_normal_approx_loss(
             log_ratio, advantages, loss_mask, cu_seqlens
         )
     elif importance_sampling_level == "s_1":
         seq_behav_imp_weight, _ = _compute_sequence_level_ratio_and_advantages(
-            behav_imp_weight, advantages, behav_mask, cu_seqlens
+            behav_kl, advantages, behav_mask, cu_seqlens
         )
         pg_loss = pg_loss * seq_behav_imp_weight
         logging_loss = pg_loss.detach()
         pg_loss = (torch.where(loss_mask, pg_loss, 0).sum()) / (cu_seqlens.size(0) - 1)
+    elif importance_sampling_level == "g_2":
+        log_ratio = logprobs - old_logprobs
+        logging_loss = pg_loss.detach()
+        pg_loss = _compute_g_2_loss(
+            log_ratio, advantages, loss_mask, cu_seqlens
+        )
     else:
         # IMPORTANT: ratio clip is disabled for these new methods currently
         batch_size = ratio.size(0) if ratio.dim() == 2 else 1
