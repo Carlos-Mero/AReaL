@@ -142,14 +142,18 @@ def _compute_sequence_level_ratio_and_advantages(
     return ratio, advantages
 
 def _compute_g_2_loss(
-    log_ratio: torch.Tensor,
+    logprobs: torch.Tensor,
+    proximal_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
 ) -> torch.Tensor:
     """
     Args:
-        log_ratio: Log of probability ratios (logprobs - proximal_logprobs)
+        logprobs: log of probability of current policy
+        proximal_logprobs: log of probability of the reference policy (proximal model)
+        old_logprobs: log probability of old policy
         advantages: Per-token advantages
         loss_mask: Boolean mask indicating valid tokens
         cu_seqlens: Cumulative sequence lengths. Required for 1D tensors (packed format).
@@ -160,6 +164,10 @@ def _compute_g_2_loss(
         loss: the average loss computed via 2nd order grpo method
     """
     # Handle only 1D (packed) tensor shapes
+    # logprobs = torch.clamp(logprobs, min = -2)
+    # logprobs_old = torch.clamp(logprobs_old, min = -2)
+    log_ratio = logprobs - proximal_logprobs
+    log_ti_ratio = proximal_logprobs - old_logprobs
     if log_ratio.ndim != 1:
         raise NotImplementedError("2D (padded) tensor handling logic for lse is not implemented yet!")
 
@@ -180,10 +188,13 @@ def _compute_g_2_loss(
     # S_i = Sum(log_ratio) for sequence i
     # A_i = Mean(advantages) for sequence i (weighted by mask)
     S = torch.zeros(batch_size, device=device, dtype=dtype)
+    S_ti = torch.zeros(batch_size, device=device, dtype=dtype)
     A_sum = torch.zeros(batch_size, device=device, dtype=dtype)
     valid_counts = torch.zeros(batch_size, device=device, dtype=dtype)
 
     S.index_add_(0, batch_idx, torch.where(loss_mask, log_ratio, 0.0))
+    S_detach = S.detach()
+    S_ti.index_add_(0, batch_idx, torch.where(loss_mask, log_ti_ratio, 0.0))
     A_sum.index_add_(0, batch_idx, torch.where(loss_mask, advantages, 0.0))
     valid_counts.index_add_(0, batch_idx, loss_mask.to(dtype))
 
@@ -192,8 +203,9 @@ def _compute_g_2_loss(
     A_seq = A_sum / valid_counts.clamp(min=1.0)
 
     # Loss calculation
-    ratio_approx = 1.0 + S + 0.5 * S.pow(2)
-    loss = - (A_seq * ratio_approx).mean()
+    ratio_approx = 1.0 + S_detach + 0.5 * S_detach.pow(2)
+    ti_ratio_approx = 1.0 + S_ti + 0.5 * S_ti.pow(2)
+    loss = - (A_seq * ti_ratio_approx * ratio_approx * S).mean()
     return loss
 
 def _compute_lse_normal_approx_loss(
@@ -367,10 +379,9 @@ def ppo_actor_loss_fn(
         logging_loss = pg_loss.detach()
         pg_loss = (torch.where(loss_mask, pg_loss, 0).sum()) / (cu_seqlens.size(0) - 1)
     elif importance_sampling_level == "g_2":
-        log_ratio = logprobs - old_logprobs
         logging_loss = pg_loss.detach()
         pg_loss = _compute_g_2_loss(
-            log_ratio, advantages, loss_mask, cu_seqlens
+            logprobs, proximal_logprobs, advantages, loss_mask, cu_seqlens
         )
     else:
         # IMPORTANT: ratio clip is disabled for these new methods currently
