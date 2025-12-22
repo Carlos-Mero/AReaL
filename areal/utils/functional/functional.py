@@ -203,8 +203,10 @@ def _compute_g_2_loss(
     A_seq = A_sum / valid_counts.clamp(min=1.0)
 
     # Loss calculation
-    ratio_approx = 1.0 + S_detach + 0.5 * S_detach.pow(2)
-    ti_ratio_approx = 1.0 + S_ti + 0.5 * S_ti.pow(2)
+    ratio_approx = torch.exp(torch.clamp(S_detach, max=3.0))
+    ti_ratio_approx = torch.exp(torch.clamp(S_ti, max=3.0))
+    # ratio_approx = 1.0 + S_detach + 0.5 * S_detach.pow(2)
+    # ti_ratio_approx = 1.0 + S_ti + 0.5 * S_ti.pow(2)
     loss = - (A_seq * ti_ratio_approx * ratio_approx * S).mean()
     return loss
 
@@ -381,7 +383,7 @@ def ppo_actor_loss_fn(
     elif importance_sampling_level == "g_2":
         logging_loss = pg_loss.detach()
         pg_loss = _compute_g_2_loss(
-            logprobs, proximal_logprobs, advantages, loss_mask, cu_seqlens
+            logprobs, proximal_logprobs, old_logprobs, advantages, loss_mask, cu_seqlens
         )
     else:
         # IMPORTANT: ratio clip is disabled for these new methods currently
