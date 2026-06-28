@@ -16,6 +16,8 @@ VALID_DATASETS = [
     "gsm8k",
     "clevr_count_70k",
     "geometry3k",
+    "hendrycks_math",
+    "dapo_math_17k",
     "virl39k",
     "hh-rlhf",
     "torl_data",
@@ -90,6 +92,46 @@ def _get_custom_dataset(
             path=path,
             split=split,
             processor=processor,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "hendrycks_math" in path.lower() and type == "sft":
+        from .math import get_hendrycks_math_sft_dataset
+
+        return get_hendrycks_math_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "hendrycks_math" in path.lower() and type == "rl":
+        from .math import get_hendrycks_math_rl_dataset
+
+        return get_hendrycks_math_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "dapo-math-17k" in path.lower() and type == "sft":
+        from .math import get_dapo_math_17k_sft_dataset
+
+        return get_dapo_math_17k_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "dapo-math-17k" in path.lower() and type == "rl":
+        from .math import get_dapo_math_17k_rl_dataset
+
+        return get_dapo_math_17k_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
             max_length=max_length,
             **kwargs,
         )
