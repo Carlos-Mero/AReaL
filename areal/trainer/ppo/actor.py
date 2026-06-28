@@ -12,7 +12,7 @@ from areal.experimental.training_service.controller.controller import (
 )
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
-from areal.trainer.ppo.stats import infer_token_denominator
+from areal.trainer.ppo.stats import estimate_sequence_entropy, infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
     PROX_APPROX_METHOD_LINEAR,
@@ -328,6 +328,10 @@ class PPOActor:
             )
         ########## Logging code ends ##########
 
+        data["correct_response_mask"] = (reward_score > 0).view(-1, 1).expand_as(
+            attn_mask
+        )
+
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
         for key in ["rewards", "tot_rewards", "kl_rewards"]:
@@ -561,6 +565,39 @@ def grpo_loss_fn(
         dual_clip_ratio=stat["dual_clip_mask"].float(),
         denominator="n_valid_tokens",
     )
+
+    (
+        sequence_entropy,
+        entropy_sequence_mask,
+        correct_entropy_sequence_mask,
+        incorrect_entropy_sequence_mask,
+    ) = estimate_sequence_entropy(
+        entropy=entropy,
+        loss_mask=loss_mask,
+        correct_response_mask=input_data.get("correct_response_mask"),
+        cu_seqlens=input_data.get("cu_seqlens"),
+    )
+    entropy_denominators = {"n_entropy_seqs": entropy_sequence_mask}
+    if correct_entropy_sequence_mask is not None:
+        entropy_denominators["correct_entropy_seqs"] = correct_entropy_sequence_mask
+    if incorrect_entropy_sequence_mask is not None:
+        entropy_denominators["incorrect_entropy_seqs"] = incorrect_entropy_sequence_mask
+    stats_tracker.denominator(**entropy_denominators)
+    stats_tracker.stat(
+        sequence_entropy=sequence_entropy,
+        denominator="n_entropy_seqs",
+    )
+    if correct_entropy_sequence_mask is not None:
+        stats_tracker.stat(
+            true_conditional_entropy=sequence_entropy,
+            denominator="correct_entropy_seqs",
+        )
+    if incorrect_entropy_sequence_mask is not None:
+        stats_tracker.stat(
+            false_conditional_entropy=sequence_entropy,
+            denominator="incorrect_entropy_seqs",
+        )
+
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
         stats_tracker.stat(
