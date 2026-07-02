@@ -304,7 +304,7 @@ Configuration for reward/advantage normalization.
 
 | Parameter        | Type           | Default   | Description                                                                                                      |
 | ---------------- | -------------- | --------- | ---------------------------------------------------------------------------------------------------------------- |
-| `mean_level`     | string \| None | `"batch"` | Mean level for normalization. None for no mean normalization. **Choices:** `batch`, `group`, `None`              |
+| `mean_level`     | string \| None | `"batch"` | Mean level for normalization. None for no mean normalization. **Choices:** `batch`, `group`, `maxrl`, `None`     |
 | `mean_leave1out` | boolean        | `False`   | Whether to use leave-one-out average.                                                                            |
 | `std_level`      | string \| None | `"batch"` | Standard deviation level for normalization. None for no std normalization. **Choices:** `batch`, `group`, `None` |
 | `std_unbiased`   | boolean        | `True`    | Whether to use unbiased standard deviation computation. Defaults to True (changed from False in v0.3.4).         |

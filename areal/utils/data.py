@@ -1382,6 +1382,8 @@ class Normalization:
     Supports independent specification of normalization level for mean and std:
     - "batch": normalize across entire batch (with optional all_reduce in distributed setting)
     - "group": normalize within fixed-size groups
+    - "maxrl": center sequence-level sums within fixed-size groups and scale by
+      the number of positive centered sequence advantages
     - None: no centering or no std scaling
     """
 
@@ -1407,6 +1409,13 @@ class Normalization:
         # Early return if no elements are active (all masked out)
         if loss_mask is not None and loss_mask.sum().item() == 0:
             return x.float()
+
+        if self.mean_level == "maxrl":
+            return self._compute_maxrl_advantages(
+                x,
+                loss_mask,
+                high_precision=high_precision,
+            )
 
         # Step 1: Compute mean
         if self.mean_level == "batch":
@@ -1593,6 +1602,47 @@ class Normalization:
         if factor.item() == 0:
             return torch.ones_like(x_sum_sq)
         return (x_sum_sq / factor).sqrt()
+
+    def _compute_maxrl_advantages(
+        self,
+        x: torch.Tensor,
+        loss_mask: torch.Tensor | None,
+        high_precision: bool,
+    ) -> torch.Tensor:
+        """Compute MaxRL group advantages and broadcast them to valid tokens."""
+        bs = x.size(0)
+        dtype = torch.float64 if high_precision else torch.float32
+        x_work = x.to(dtype)
+        mask = (
+            torch.ones_like(x_work, dtype=dtype)
+            if loss_mask is None
+            else loss_mask.to(dtype)
+        )
+        normalized = torch.zeros_like(x_work)
+        seq_dims = tuple(range(1, x_work.ndim))
+
+        for i in range(0, bs // self.group_size):
+            s = slice(i * self.group_size, (i + 1) * self.group_size)
+            xx = x_work[s]
+            mm = mask[s]
+            if xx.ndim == 1:
+                seq_advantages = xx
+            else:
+                seq_advantages = (xx * mm).sum(dim=seq_dims)
+
+            centered = seq_advantages - seq_advantages.mean()
+            positive_count = (centered > 0).sum()
+            if positive_count.item() == 0:
+                continue
+
+            group_advantages = centered / positive_count.to(dtype)
+            if xx.ndim == 1:
+                normalized[s] = group_advantages
+            else:
+                view_shape = (group_advantages.shape[0],) + (1,) * (xx.ndim - 1)
+                normalized[s] = group_advantages.view(view_shape).expand_as(xx) * mm
+
+        return normalized.float()
 
 
 class KLEstimator:
