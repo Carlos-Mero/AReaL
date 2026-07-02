@@ -101,7 +101,7 @@ class LocalScheduler(Scheduler):
         self,
         gpu_devices: list[int] | None = None,
         log_dir: str | None = None,
-        startup_timeout: float = 30.0,
+        startup_timeout: float = 300.0,
         health_check_interval: float = 1.0,
         *,
         experiment_name: str | None = None,
@@ -285,7 +285,7 @@ class LocalScheduler(Scheduler):
         session: aiohttp.ClientSession,
         host: str,
         port: int,
-        timeout: float = 60,
+        timeout: float = 300,
     ) -> bool:
         url = f"http://{format_hostport(host, port)}/health"
         deadline = time.time() + timeout

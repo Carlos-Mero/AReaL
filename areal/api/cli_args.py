@@ -2780,7 +2780,7 @@ class _DatasetConfig:
         },
     )
     setup_timeout: float = field(
-        default=120.0,
+        default=300.0,
         metadata={
             "help": "Timeout in seconds for the data service to load and register a dataset. "
             "Increase this value when loading large datasets for the first time "
