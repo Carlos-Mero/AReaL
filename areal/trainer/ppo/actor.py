@@ -28,10 +28,13 @@ from areal.utils.data import (
     KLEstimator,
     Normalization,
     batched_call,
+    concat_batch,
+    split_batch,
     split_padded_tensor_dict_into_mb_list,
 )
 from areal.utils.functional import (
     cispo_loss_fn,
+    logit_shift_loss_fn,
     ppo_actor_loss_fn,
     reward_overlong_penalty,
     sapo_loss_fn,
@@ -115,6 +118,7 @@ class PPOActor:
         # Log other critical config
         logger.info("=" * 70)
         logger.info("Training Parameters:")
+        logger.info(f"  loss_type: {config.loss_type}")
         logger.info(
             f"  importance_sampling_level: {getattr(config, 'importance_sampling_level', 'token')}"
         )
@@ -141,9 +145,17 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self.adv_norm is not None and self.adv_norm.mean_level == "maxrl":
+            batched, meta = concat_batch(data)
+            result = self._compute_advantages(
+                batched, adv_group_sizes=meta.traj_group_sizes
+            )
+            return split_batch(result, meta)
         return batched_call(self._compute_advantages, data)
 
-    def _compute_advantages(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _compute_advantages(
+        self, data: dict[str, Any], adv_group_sizes: list[int] | None = None
+    ) -> dict[str, Any]:
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
@@ -237,7 +249,10 @@ class PPOActor:
 
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
-            advantages = self.adv_norm(advantages, loss_mask)
+            norm_input = rewards if self.adv_norm.mean_level == "maxrl" else advantages
+            advantages = self.adv_norm(
+                norm_input, loss_mask, group_sizes=adv_group_sizes
+            )
 
         # Store data in the dict.
         data["advantages"] = advantages
@@ -352,6 +367,7 @@ class PPOActor:
                     mb,
                     loss_fn=functools.partial(
                         grpo_loss_fn,
+                        loss_type=self.config.loss_type,
                         eps_clip=self.config.eps_clip,
                         eps_clip_higher=self.config.eps_clip_higher,
                         c_clip=self.config.c_clip,
@@ -418,6 +434,7 @@ def grpo_loss_fn(
     eps_clip: float,
     eps_clip_higher: float | None,
     c_clip: float | None,
+    loss_type: str = "reinforce",
     rejection_sampling: RejectionSamplingConfig | None = None,
     m2_threshold: float | None = None,
     importance_sampling_level: str = "token",
@@ -454,8 +471,20 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    # Use CISPO, SAPO, or PPO loss
-    if use_cispo_loss:
+    # Use direct logit shift, CISPO, SAPO, or PPO loss.
+    if loss_type == "logit_shift":
+        if use_cispo_loss or use_sapo_loss:
+            raise ValueError(
+                "logit_shift is mutually exclusive with SAPO and CISPO. "
+                "Enable only one actor loss."
+            )
+        loss, stat = logit_shift_loss_fn(
+            logprobs=logprobs,
+            advantages=advantages,
+            loss_mask=loss_mask,
+            proximal_logprobs=prox_logp,
+        )
+    elif loss_type == "reinforce" and use_cispo_loss:
         if use_sapo_loss:
             raise ValueError(
                 "CISPO and SAPO are mutually exclusive surrogates. "
@@ -477,7 +506,7 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             cu_seqlens=input_data.get("cu_seqlens"),
         )
-    elif use_sapo_loss:
+    elif loss_type == "reinforce" and use_sapo_loss:
         if use_decoupled_loss:
             raise ValueError(
                 "SAPO is not compatible with `use_decoupled_loss=True`. "
@@ -493,7 +522,7 @@ def grpo_loss_fn(
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
         )
-    else:
+    elif loss_type == "reinforce":
         loss, stat = ppo_actor_loss_fn(
             logprobs=logprobs,
             old_logprobs=old_logp,
@@ -506,6 +535,11 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported actor loss_type: {loss_type!r}. "
+            "Expected 'reinforce' or 'logit_shift'."
         )
 
     # Joint Distillation KL Loss

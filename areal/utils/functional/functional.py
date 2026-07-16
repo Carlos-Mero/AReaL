@@ -449,6 +449,50 @@ def compute_binary_kl_divergence(
     return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
 
 
+def logit_shift_loss_fn(
+    logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    proximal_logprobs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """Construct a direct selected-logit policy loss.
+
+    AReaL has one selected next-token target at each training position. For a
+    target logit ``z_t``, the reference objective
+
+    ``softplus(logsumexp(z_outside) - z_t)``
+
+    is exactly ``-log_softmax(z)_t``. Reusing the differentiable selected-token
+    log-probability therefore gives the same direct logit gradients without
+    materializing or gathering full-vocabulary logits across parallel ranks.
+
+    Positive advantages raise the selected logit relative to the other logits;
+    negative advantages lower it. Unlike the existing PPO/GRPO surrogate, this
+    loss does not apply importance-sampling ratios or clipping.
+    """
+    loss_mask = loss_mask.bool()
+    advantages = advantages.detach()
+    per_token_loss = -advantages * logprobs
+    masked_loss = torch.where(loss_mask, per_token_loss, 0.0)
+    loss = masked_loss.sum() / loss_mask.count_nonzero().clamp(min=1)
+
+    if proximal_logprobs is None:
+        approx_kl = torch.zeros_like(logprobs)
+    else:
+        approx_kl = (logprobs - proximal_logprobs).detach()
+    zero_mask = torch.zeros_like(loss_mask)
+    stat = dict(
+        loss=masked_loss.detach(),
+        importance_weight=torch.where(
+            loss_mask, torch.ones_like(logprobs), torch.zeros_like(logprobs)
+        ),
+        approx_kl=approx_kl,
+        clip_mask=zero_mask,
+        dual_clip_mask=zero_mask.clone(),
+    )
+    return loss, stat
+
+
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
     proximal_logprobs: torch.Tensor,

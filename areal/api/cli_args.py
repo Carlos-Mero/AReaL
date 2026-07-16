@@ -8,7 +8,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 import uvloop
 import yaml
@@ -1481,6 +1481,15 @@ class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
     # Core PPO/GRPO Parameters
+    loss_type: Literal["reinforce", "logit_shift"] = field(
+        default="reinforce",
+        metadata={
+            "help": "Actor loss type. 'reinforce' uses the existing PPO/GRPO "
+            "surrogate; 'logit_shift' directly weights selected-token logits by "
+            "their advantages.",
+            "choices": ["reinforce", "logit_shift"],
+        },
+    )
     ppo_n_minibatches: int = field(
         default=4, metadata={"help": "Number of minibatches for each PPO update"}
     )
@@ -1649,6 +1658,19 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if self.loss_type not in ("reinforce", "logit_shift"):
+            raise ValueError(
+                "loss_type must be 'reinforce' or 'logit_shift', "
+                f"got {self.loss_type!r}"
+            )
+        if self.loss_type == "logit_shift" and (
+            self.use_sapo_loss or self.use_cispo_loss
+        ):
+            raise ValueError(
+                "logit_shift is mutually exclusive with SAPO and CISPO. "
+                "Disable use_sapo_loss and use_cispo_loss."
+            )
+
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(

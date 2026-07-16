@@ -1402,6 +1402,7 @@ class Normalization:
         loss_mask: torch.Tensor | None = None,
         high_precision: bool = True,
         reduce_group=None,
+        group_sizes: list[int] | None = None,
     ) -> torch.Tensor:
         bs = x.size(0)
         eps = self.eps
@@ -1415,6 +1416,7 @@ class Normalization:
                 x,
                 loss_mask,
                 high_precision=high_precision,
+                group_sizes=group_sizes,
             )
 
         # Step 1: Compute mean
@@ -1608,9 +1610,20 @@ class Normalization:
         x: torch.Tensor,
         loss_mask: torch.Tensor | None,
         high_precision: bool,
+        group_sizes: list[int] | None,
     ) -> torch.Tensor:
         """Compute MaxRL group advantages and broadcast them to valid tokens."""
         bs = x.size(0)
+        if group_sizes is None:
+            group_sizes = [self.group_size] * (bs // self.group_size)
+            remainder = bs % self.group_size
+            if remainder:
+                group_sizes.append(remainder)
+        elif sum(group_sizes) != bs:
+            raise ValueError(
+                f"group_sizes must sum to batch size {bs}, got {sum(group_sizes)}"
+            )
+
         dtype = torch.float64 if high_precision else torch.float32
         x_work = x.to(dtype)
         mask = (
@@ -1621,8 +1634,10 @@ class Normalization:
         normalized = torch.zeros_like(x_work)
         seq_dims = tuple(range(1, x_work.ndim))
 
-        for i in range(0, bs // self.group_size):
-            s = slice(i * self.group_size, (i + 1) * self.group_size)
+        start = 0
+        for group_size in group_sizes:
+            s = slice(start, start + group_size)
+            start += group_size
             xx = x_work[s]
             mm = mask[s]
             if xx.ndim == 1:
