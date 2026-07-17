@@ -454,6 +454,7 @@ def logit_shift_loss_fn(
     advantages: torch.Tensor,
     loss_mask: torch.Tensor,
     proximal_logprobs: torch.Tensor | None = None,
+    loss_mask_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Construct a direct selected-logit policy loss.
 
@@ -471,10 +472,12 @@ def logit_shift_loss_fn(
     loss does not apply importance-sampling ratios or clipping.
     """
     loss_mask = loss_mask.bool()
+    if loss_mask_count is None:
+        loss_mask_count = loss_mask.count_nonzero()
     advantages = advantages.detach()
     per_token_loss = -advantages * logprobs
     masked_loss = torch.where(loss_mask, per_token_loss, 0.0)
-    loss = masked_loss.sum() / loss_mask.count_nonzero().clamp(min=1)
+    loss = masked_loss.sum() / loss_mask_count.clamp(min=1)
 
     if proximal_logprobs is None:
         approx_kl = torch.zeros_like(logprobs)
@@ -490,6 +493,98 @@ def logit_shift_loss_fn(
         clip_mask=zero_mask,
         dual_clip_mask=zero_mask.clone(),
     )
+    return loss, stat
+
+
+def prob_sq_loss_fn(
+    logprobs: torch.Tensor,
+    proximal_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    loss_mask_count: torch.Tensor | None = None,
+    importance_sampling_level: str = "token",
+    cu_seqlens: torch.Tensor | None = None,
+    old_logprobs: torch.Tensor | None = None,
+    rejection_sampling: RejectionSamplingConfig | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """Construct a ratio-corrected probability policy surrogate.
+
+    For selected-token probability ``p``, current-to-proximal importance ratio
+    ``r``, and advantage ``A``, the minimized per-token loss is
+    ``-A * stop_gradient(r) * p``. The ratio corrects samples toward the current
+    policy while stop-gradient ensures that only the explicit probability term
+    contributes gradients.
+
+    ``advantages`` is the final value produced by the actor's advantage path,
+    so the same loss supports both standard GRPO and MaxRL normalization.
+    """
+    loss_mask = loss_mask.bool()
+    if loss_mask_count is None:
+        loss_mask_count = loss_mask.count_nonzero()
+    advantages = advantages.detach()
+    if rejection_sampling is not None:
+        if old_logprobs is None:
+            raise ValueError(
+                "old_logprobs is required when prob_sq uses rejection sampling."
+            )
+        rs_result = apply_rejection_sampling(
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            loss_mask=loss_mask,
+            cu_seqlens=cu_seqlens,
+            config=rejection_sampling,
+        )
+        loss_mask = rs_result.loss_mask
+        behave_imp_weight = rs_result.behave_imp_weight.detach()
+
+    log_ratio = logprobs.float() - proximal_logprobs.float()
+    if importance_sampling_level == "sequence":
+        importance_ratio, advantages = _compute_sequence_level_ratio_and_advantages(
+            log_ratio, advantages, loss_mask, cu_seqlens
+        )
+    elif importance_sampling_level == "token":
+        importance_ratio = torch.exp(log_ratio)
+    else:
+        raise ValueError(
+            f"Invalid importance_sampling_level: {importance_sampling_level}. "
+            "Must be 'token' or 'sequence'."
+        )
+
+    importance_ratio = importance_ratio.detach()
+    probabilities = logprobs.exp()
+    per_token_loss = -advantages * importance_ratio * probabilities
+    if rejection_sampling is not None:
+        per_token_loss = per_token_loss * behave_imp_weight
+    masked_loss = torch.where(loss_mask, per_token_loss, 0.0)
+    loss = masked_loss.sum() / loss_mask_count.clamp(min=1)
+
+    zero_mask = torch.zeros_like(loss_mask)
+    effective_ratio = importance_ratio
+    if rejection_sampling is not None:
+        effective_ratio = effective_ratio * behave_imp_weight
+    stat = dict(
+        loss=masked_loss.detach(),
+        importance_weight=torch.where(
+            loss_mask,
+            importance_ratio,
+            torch.zeros_like(importance_ratio),
+        ),
+        approx_kl=log_ratio.detach(),
+        clip_mask=zero_mask,
+        dual_clip_mask=zero_mask.clone(),
+        prob_sq_probability=probabilities.detach(),
+        prob_sq_weight=effective_ratio.detach(),
+    )
+    if rejection_sampling is not None:
+        behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
+        behave_mask = (behave_imp_weight > 0).logical_and(loss_mask)
+        behave_approx_kl = torch.where(behave_mask, behave_approx_kl, 0.0)
+        stat.update(
+            behave_approx_kl=behave_approx_kl,
+            behave_imp_weight=behave_imp_weight,
+            behave_mask=behave_mask,
+            filtered_fraction=rs_result.filtered_fraction,
+        )
     return loss, stat
 
 

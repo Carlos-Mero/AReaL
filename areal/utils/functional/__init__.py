@@ -10,6 +10,7 @@ from areal.utils.functional.functional import (
     masked_normalization,
     ppo_actor_loss_fn,
     ppo_critic_loss_fn,
+    prob_sq_loss_fn,
     reward_overlong_penalty,
     sapo_loss_fn,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "masked_normalization",
     "ppo_actor_loss_fn",
     "ppo_critic_loss_fn",
+    "prob_sq_loss_fn",
     "reward_overlong_penalty",
     "sapo_loss_fn",
     # vocab_parallel.py

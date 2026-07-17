@@ -1486,8 +1486,9 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Actor loss type. 'reinforce' uses the existing PPO/GRPO "
             "surrogate; 'logit_shift' directly weights selected-token logits by "
-            "their advantages.",
-            "choices": ["reinforce", "logit_shift"],
+            "their advantages; 'prob_sq' replaces log-probability with probability "
+            "and weights it by a detached current-to-proximal importance ratio.",
+            "choices": ["reinforce", "logit_shift", "prob_sq"],
         },
     )
     ppo_n_minibatches: int = field(
@@ -1658,16 +1659,16 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
-        if self.loss_type not in ("reinforce", "logit_shift"):
+        if self.loss_type not in ("reinforce", "logit_shift", "prob_sq"):
             raise ValueError(
-                "loss_type must be 'reinforce' or 'logit_shift', "
+                "loss_type must be 'reinforce', 'logit_shift', or 'prob_sq', "
                 f"got {self.loss_type!r}"
             )
-        if self.loss_type == "logit_shift" and (
+        if self.loss_type in ("logit_shift", "prob_sq") and (
             self.use_sapo_loss or self.use_cispo_loss
         ):
             raise ValueError(
-                "logit_shift is mutually exclusive with SAPO and CISPO. "
+                f"{self.loss_type} is mutually exclusive with SAPO and CISPO. "
                 "Disable use_sapo_loss and use_cispo_loss."
             )
 

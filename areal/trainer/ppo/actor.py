@@ -36,6 +36,7 @@ from areal.utils.functional import (
     cispo_loss_fn,
     logit_shift_loss_fn,
     ppo_actor_loss_fn,
+    prob_sq_loss_fn,
     reward_overlong_penalty,
     sapo_loss_fn,
 )
@@ -453,6 +454,7 @@ def grpo_loss_fn(
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
     loss_mask = input_data["loss_mask"].bool()
+    loss_mask_count = loss_mask.count_nonzero()
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
@@ -471,7 +473,7 @@ def grpo_loss_fn(
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
-    # Use direct logit shift, CISPO, SAPO, or PPO loss.
+    # Use a direct actor loss, CISPO, SAPO, or PPO loss.
     if loss_type == "logit_shift":
         if use_cispo_loss or use_sapo_loss:
             raise ValueError(
@@ -483,6 +485,24 @@ def grpo_loss_fn(
             advantages=advantages,
             loss_mask=loss_mask,
             proximal_logprobs=prox_logp,
+            loss_mask_count=loss_mask_count,
+        )
+    elif loss_type == "prob_sq":
+        if use_cispo_loss or use_sapo_loss:
+            raise ValueError(
+                "prob_sq is mutually exclusive with SAPO and CISPO. "
+                "Enable only one actor loss."
+            )
+        loss, stat = prob_sq_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=prox_logp,
+            advantages=advantages,
+            loss_mask=loss_mask,
+            loss_mask_count=loss_mask_count,
+            importance_sampling_level=importance_sampling_level,
+            cu_seqlens=input_data.get("cu_seqlens"),
+            old_logprobs=old_logp,
+            rejection_sampling=rejection_sampling,
         )
     elif loss_type == "reinforce" and use_cispo_loss:
         if use_sapo_loss:
@@ -539,7 +559,7 @@ def grpo_loss_fn(
     else:
         raise ValueError(
             f"Unsupported actor loss_type: {loss_type!r}. "
-            "Expected 'reinforce' or 'logit_shift'."
+            "Expected 'reinforce', 'logit_shift', or 'prob_sq'."
         )
 
     # Joint Distillation KL Loss
@@ -641,6 +661,17 @@ def grpo_loss_fn(
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
+
+    if "prob_sq_weight" in stat:
+        stats_tracker.stat(
+            prob_sq_weight=stat["prob_sq_weight"],
+            denominator="n_valid_tokens",
+        )
+    if "prob_sq_probability" in stat:
+        stats_tracker.stat(
+            prob_sq_probability=stat["prob_sq_probability"],
+            denominator="n_valid_tokens",
+        )
 
     if vocab_min_logits is not None and vocab_max_logits is not None:
         stats_tracker.stat(
