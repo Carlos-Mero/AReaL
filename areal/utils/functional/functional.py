@@ -459,9 +459,10 @@ def logit_shift_reward_shaping(
     """Scale token rewards by capped inverse pre-update policy probability.
 
     ``policy_logprobs`` comes from the training actor's no-grad forward and must
-    already be aligned with reward positions. The returned tuple contains shaped
-    rewards, masked weights, and a mask indicating which valid tokens reached
-    ``ls_clip``.
+    already be aligned with reward positions. After inverse-probability scaling,
+    rewards are divided by ``ls_clip`` to keep their overall magnitude stable.
+    The returned tuple contains shaped rewards, masked inverse-probability weights,
+    and a mask indicating which valid tokens reached ``ls_clip``.
     """
     if not math.isfinite(ls_clip) or ls_clip <= 0:
         raise ValueError(f"ls_clip must be finite and positive, got {ls_clip!r}")
@@ -481,7 +482,7 @@ def logit_shift_reward_shaping(
         loss_mask, inverse_probability, torch.zeros_like(inverse_probability)
     )
     shaped_rewards = torch.where(
-        loss_mask, rewards * weights, torch.zeros_like(rewards)
+        loss_mask, rewards * weights / ls_clip, torch.zeros_like(rewards)
     )
     clipped_mask = (-policy_logprobs.detach().float() > log_cap).logical_and(loss_mask)
     return shaped_rewards, weights, clipped_mask
