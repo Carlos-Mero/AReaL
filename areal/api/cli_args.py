@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import warnings
 from dataclasses import MISSING as dataclass_missing
@@ -1481,14 +1482,22 @@ class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
     # Core PPO/GRPO Parameters
-    loss_type: str = field(
+    loss_type: Literal["reinforce", "logit_shift", "prob_sq"] = field(
         default="reinforce",
         metadata={
             "help": "Actor loss type. 'reinforce' uses the existing PPO/GRPO "
-            "surrogate; 'logit_shift' directly weights selected-token logits by "
-            "their advantages; 'prob_sq' replaces log-probability with probability "
+            "surrogate; 'logit_shift' applies the PPO/GSPO surrogate with a capped "
+            "inverse selected-token probability weight; 'prob_sq' replaces "
+            "log-probability with probability "
             "and weights it by a detached current-to-proximal importance ratio.",
             "choices": ["reinforce", "logit_shift", "prob_sq"],
+        },
+    )
+    ls_clip: float = field(
+        default=10.0,
+        metadata={
+            "help": "Maximum inverse-probability weight for loss_type='logit_shift'. "
+            "Must be finite and positive."
         },
     )
     ppo_n_minibatches: int = field(
@@ -1670,6 +1679,10 @@ class PPOActorConfig(TrainEngineConfig):
             raise ValueError(
                 f"{self.loss_type} is mutually exclusive with SAPO and CISPO. "
                 "Disable use_sapo_loss and use_cispo_loss."
+            )
+        if not math.isfinite(self.ls_clip) or self.ls_clip <= 0:
+            raise ValueError(
+                f"ls_clip must be finite and positive, got {self.ls_clip!r}"
             )
 
         # Warn if rejection_sampling is configured but use_decoupled_loss is False

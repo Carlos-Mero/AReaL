@@ -120,6 +120,8 @@ class PPOActor:
         logger.info("=" * 70)
         logger.info("Training Parameters:")
         logger.info(f"  loss_type: {config.loss_type}")
+        if config.loss_type == "logit_shift":
+            logger.info(f"  ls_clip: {config.ls_clip}")
         logger.info(
             f"  importance_sampling_level: {getattr(config, 'importance_sampling_level', 'token')}"
         )
@@ -325,6 +327,8 @@ class PPOActor:
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
         )
+        if self.config.loss_type == "logit_shift":
+            scalars["ls_clip"] = self.config.ls_clip
         if self.config.c_clip is not None:
             scalars["c_clip"] = self.config.c_clip
             scalars["use_dual_clip"] = 1
@@ -369,6 +373,7 @@ class PPOActor:
                     loss_fn=functools.partial(
                         grpo_loss_fn,
                         loss_type=self.config.loss_type,
+                        ls_clip=self.config.ls_clip,
                         eps_clip=self.config.eps_clip,
                         eps_clip_higher=self.config.eps_clip_higher,
                         c_clip=self.config.c_clip,
@@ -436,6 +441,7 @@ def grpo_loss_fn(
     eps_clip_higher: float | None,
     c_clip: float | None,
     loss_type: str = "reinforce",
+    ls_clip: float = 10.0,
     rejection_sampling: RejectionSamplingConfig | None = None,
     m2_threshold: float | None = None,
     importance_sampling_level: str = "token",
@@ -482,9 +488,17 @@ def grpo_loss_fn(
             )
         loss, stat = logit_shift_loss_fn(
             logprobs=logprobs,
-            advantages=advantages,
-            loss_mask=loss_mask,
             proximal_logprobs=prox_logp,
+            old_logprobs=old_logp,
+            advantages=advantages,
+            eps_clip=eps_clip,
+            eps_clip_higher=eps_clip_higher,
+            loss_mask=loss_mask,
+            ls_clip=ls_clip,
+            c_clip=c_clip,
+            rejection_sampling=rejection_sampling,
+            importance_sampling_level=importance_sampling_level,
+            cu_seqlens=input_data.get("cu_seqlens"),
             loss_mask_count=loss_mask_count,
         )
     elif loss_type == "prob_sq":
@@ -661,6 +675,14 @@ def grpo_loss_fn(
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
+
+    if "logit_shift_weight" in stat:
+        stats_tracker.stat(
+            logit_shift_weight=stat["logit_shift_weight"],
+            logit_shift_probability=stat["logit_shift_probability"],
+            ls_clip_saturated=stat["ls_clipped_mask"].float(),
+            denominator="n_valid_tokens",
+        )
 
     if "prob_sq_weight" in stat:
         stats_tracker.stat(
