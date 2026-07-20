@@ -450,62 +450,41 @@ def compute_binary_kl_divergence(
     return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))
 
 
-def logit_shift_loss_fn(
-    logprobs: torch.Tensor,
-    proximal_logprobs: torch.Tensor,
-    old_logprobs: torch.Tensor,
-    advantages: torch.Tensor,
-    eps_clip: float,
+def logit_shift_reward_shaping(
+    rewards: torch.Tensor,
+    policy_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     ls_clip: float = 10.0,
-    eps_clip_higher: float | None = None,
-    c_clip: float | None = None,
-    rejection_sampling: RejectionSamplingConfig | None = None,
-    importance_sampling_level: str = "token",
-    cu_seqlens: torch.Tensor | None = None,
-    loss_mask_count: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict]:
-    """Apply PPO/GSPO with a capped inverse selected-token probability weight.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scale token rewards by capped inverse pre-update policy probability.
 
-    Each token's standard PPO/GSPO surrogate is multiplied by
-    ``min(1 / stop_gradient(pi_t), ls_clip)``, where ``pi_t`` is the current
-    selected-token probability. Computing the weight from a clamped negative
-    log-probability avoids overflow for extremely unlikely tokens.
+    ``policy_logprobs`` comes from the training actor's no-grad forward and must
+    already be aligned with reward positions. The returned tuple contains shaped
+    rewards, masked weights, and a mask indicating which valid tokens reached
+    ``ls_clip``.
     """
     if not math.isfinite(ls_clip) or ls_clip <= 0:
         raise ValueError(f"ls_clip must be finite and positive, got {ls_clip!r}")
+    if rewards.shape != policy_logprobs.shape or rewards.shape != loss_mask.shape:
+        raise ValueError(
+            "rewards, policy_logprobs, and loss_mask must have identical shapes, "
+            f"got {rewards.shape}, {policy_logprobs.shape}, and {loss_mask.shape}"
+        )
 
+    loss_mask = loss_mask.bool()
     log_cap = math.log(ls_clip)
     inverse_probability = torch.exp(
-        torch.clamp(-logprobs.detach().float(), max=log_cap)
+        torch.clamp(-policy_logprobs.detach().float(), max=log_cap)
     )
     inverse_probability = torch.clamp(inverse_probability, min=0.0, max=ls_clip)
-
-    loss, stat = ppo_actor_loss_fn(
-        logprobs=logprobs,
-        proximal_logprobs=proximal_logprobs,
-        old_logprobs=old_logprobs,
-        advantages=advantages,
-        eps_clip=eps_clip,
-        loss_mask=loss_mask,
-        eps_clip_higher=eps_clip_higher,
-        c_clip=c_clip,
-        rejection_sampling=rejection_sampling,
-        importance_sampling_level=importance_sampling_level,
-        cu_seqlens=cu_seqlens,
-        surrogate_weight=inverse_probability,
-        loss_mask_count=loss_mask_count,
+    weights = torch.where(
+        loss_mask, inverse_probability, torch.zeros_like(inverse_probability)
     )
-    final_weight = stat.pop("surrogate_weight")
-    final_mask = final_weight > 0
-    stat.update(
-        logit_shift_weight=final_weight,
-        logit_shift_probability=torch.where(
-            final_mask, logprobs.detach().exp(), torch.zeros_like(logprobs)
-        ),
-        ls_clipped_mask=(-logprobs.detach().float() > log_cap).logical_and(final_mask),
+    shaped_rewards = torch.where(
+        loss_mask, rewards * weights, torch.zeros_like(rewards)
     )
-    return loss, stat
+    clipped_mask = (-policy_logprobs.detach().float() > log_cap).logical_and(loss_mask)
+    return shaped_rewards, weights, clipped_mask
 
 
 def prob_sq_loss_fn(
@@ -612,8 +591,6 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    surrogate_weight: torch.Tensor | None = None,
-    loss_mask_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -651,16 +628,12 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
-        surrogate_weight: Optional detached per-token multiplier applied after PPO
-            and dual-clip branch selection, before behavior weighting and reduction.
-        loss_mask_count: Optional original valid-token count used for normalization.
     """
     # Save original count BEFORE rejection sampling may modify loss_mask.
     # This keeps the denominator consistent with loss_weight_fn in actor.py,
     # which always uses the original loss_mask from input_data. Without this,
     # mask mode would inflate per-token gradients by N_original / N_kept.
-    if loss_mask_count is None:
-        loss_mask_count = loss_mask.count_nonzero()
+    loss_mask_count = loss_mask.count_nonzero() or 1
 
     # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
     if rejection_sampling is not None:
@@ -711,9 +684,6 @@ def ppo_actor_loss_fn(
     else:
         dual_clip_mask = torch.zeros_like(clip_mask)
 
-    if surrogate_weight is not None:
-        pg_loss = pg_loss * surrogate_weight.detach()
-
     # Apply behavioural importance weight from rejection sampling
     if rejection_sampling is not None:
         behave_approx_kl = proximal_logprobs.detach() - old_logprobs.detach()
@@ -722,7 +692,7 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count.clamp(min=1)
+    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
     stat = dict(
@@ -732,13 +702,6 @@ def ppo_actor_loss_fn(
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
     )
-    if surrogate_weight is not None:
-        stat["surrogate_weight"] = torch.where(
-            loss_mask,
-            surrogate_weight.detach(),
-            torch.zeros_like(surrogate_weight),
-        )
-
     if rejection_sampling is not None:
         stat.update(
             behave_approx_kl=behave_approx_kl.detach(),

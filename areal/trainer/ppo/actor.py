@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -34,7 +35,7 @@ from areal.utils.data import (
 )
 from areal.utils.functional import (
     cispo_loss_fn,
-    logit_shift_loss_fn,
+    logit_shift_reward_shaping,
     ppo_actor_loss_fn,
     prob_sq_loss_fn,
     reward_overlong_penalty,
@@ -58,8 +59,15 @@ class PPOActor:
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
         self.adv_norm = Normalization(config.adv_norm) if config.adv_norm else None
+        self.use_logit_shift_reward = (
+            config.reward_norm is not None
+            and config.reward_norm.std_level == "logit-shift"
+        )
+        reward_norm_config = config.reward_norm
+        if self.use_logit_shift_reward:
+            reward_norm_config = replace(config.reward_norm, std_level=None)
         self.reward_norm = (
-            Normalization(config.reward_norm) if config.reward_norm else None
+            Normalization(reward_norm_config) if reward_norm_config else None
         )
 
         self.discount = config.discount
@@ -120,7 +128,9 @@ class PPOActor:
         logger.info("=" * 70)
         logger.info("Training Parameters:")
         logger.info(f"  loss_type: {config.loss_type}")
-        if config.loss_type == "logit_shift":
+        if self.use_logit_shift_reward:
+            logger.info("  reward shaping: logit-shift")
+            logger.info("  reward probability: PRE-UPDATE ACTOR FORWARD")
             logger.info(f"  ls_clip: {config.ls_clip}")
         logger.info(
             f"  importance_sampling_level: {getattr(config, 'importance_sampling_level', 'token')}"
@@ -190,6 +200,13 @@ class PPOActor:
 
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+        behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+        policy_logp = data.get("prox_logp") if self.use_logit_shift_reward else None
+        if self.use_logit_shift_reward and policy_logp is None:
+            raise ValueError(
+                "prox_logp is required for logit-shift reward shaping. Enable a "
+                "real policy log-probability recompute before computing advantages."
+            )
         # Apply the mask to log probabilities.
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
@@ -201,7 +218,7 @@ class PPOActor:
                 )
             old_logp = data["logprobs"] = prox_logp_value
         else:
-            old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+            old_logp = behavior_logp
             if not self.config.use_decoupled_loss:
                 # prox logp not available, use inferenced logp
                 data["prox_logp"] = old_logp
@@ -226,6 +243,17 @@ class PPOActor:
             )
         else:
             rewards[batch_indices, indices] += reward_score
+
+        if self.use_logit_shift_reward:
+            assert policy_logp is not None
+            rewards, logit_shift_weight, ls_clipped_mask = logit_shift_reward_shaping(
+                rewards=rewards,
+                policy_logprobs=policy_logp,
+                loss_mask=loss_mask,
+                ls_clip=self.config.ls_clip,
+            )
+            data["logit_shift_reward_weight"] = logit_shift_weight
+            data["ls_clipped_mask"] = ls_clipped_mask
 
         # Compute GAE.
         if "values" not in data:
@@ -313,6 +341,11 @@ class PPOActor:
             kl_rewards=data["kl_rewards"],
             final_reward=data["tot_rewards"],
         )
+        if "logit_shift_reward_weight" in data:
+            stats["logit_shift_reward_weight"] = data[
+                "logit_shift_reward_weight"
+            ].float()
+            stats["ls_clip_saturated"] = data["ls_clipped_mask"].float()
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
@@ -327,7 +360,7 @@ class PPOActor:
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
         )
-        if self.config.loss_type == "logit_shift":
+        if self.use_logit_shift_reward:
             scalars["ls_clip"] = self.config.ls_clip
         if self.config.c_clip is not None:
             scalars["c_clip"] = self.config.c_clip
@@ -348,13 +381,19 @@ class PPOActor:
             )
         ########## Logging code ends ##########
 
-        data["correct_response_mask"] = (reward_score > 0).view(-1, 1).expand_as(
-            attn_mask
+        data["correct_response_mask"] = (
+            (reward_score > 0).view(-1, 1).expand_as(attn_mask)
         )
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
-        for key in ["rewards", "tot_rewards", "kl_rewards"]:
+        for key in [
+            "rewards",
+            "tot_rewards",
+            "kl_rewards",
+            "logit_shift_reward_weight",
+            "ls_clipped_mask",
+        ]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
@@ -373,7 +412,6 @@ class PPOActor:
                     loss_fn=functools.partial(
                         grpo_loss_fn,
                         loss_type=self.config.loss_type,
-                        ls_clip=self.config.ls_clip,
                         eps_clip=self.config.eps_clip,
                         eps_clip_higher=self.config.eps_clip_higher,
                         c_clip=self.config.c_clip,
@@ -441,7 +479,6 @@ def grpo_loss_fn(
     eps_clip_higher: float | None,
     c_clip: float | None,
     loss_type: str = "reinforce",
-    ls_clip: float = 10.0,
     rejection_sampling: RejectionSamplingConfig | None = None,
     m2_threshold: float | None = None,
     importance_sampling_level: str = "token",
@@ -480,28 +517,7 @@ def grpo_loss_fn(
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
     # Use a direct actor loss, CISPO, SAPO, or PPO loss.
-    if loss_type == "logit_shift":
-        if use_cispo_loss or use_sapo_loss:
-            raise ValueError(
-                "logit_shift is mutually exclusive with SAPO and CISPO. "
-                "Enable only one actor loss."
-            )
-        loss, stat = logit_shift_loss_fn(
-            logprobs=logprobs,
-            proximal_logprobs=prox_logp,
-            old_logprobs=old_logp,
-            advantages=advantages,
-            eps_clip=eps_clip,
-            eps_clip_higher=eps_clip_higher,
-            loss_mask=loss_mask,
-            ls_clip=ls_clip,
-            c_clip=c_clip,
-            rejection_sampling=rejection_sampling,
-            importance_sampling_level=importance_sampling_level,
-            cu_seqlens=input_data.get("cu_seqlens"),
-            loss_mask_count=loss_mask_count,
-        )
-    elif loss_type == "prob_sq":
+    if loss_type == "prob_sq":
         if use_cispo_loss or use_sapo_loss:
             raise ValueError(
                 "prob_sq is mutually exclusive with SAPO and CISPO. "
@@ -573,7 +589,8 @@ def grpo_loss_fn(
     else:
         raise ValueError(
             f"Unsupported actor loss_type: {loss_type!r}. "
-            "Expected 'reinforce', 'logit_shift', or 'prob_sq'."
+            "Expected 'reinforce' or 'prob_sq'. Configure logit-shift with "
+            "actor.reward_norm.std_level='logit-shift'."
         )
 
     # Joint Distillation KL Loss
@@ -675,14 +692,6 @@ def grpo_loss_fn(
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
-
-    if "logit_shift_weight" in stat:
-        stats_tracker.stat(
-            logit_shift_weight=stat["logit_shift_weight"],
-            logit_shift_probability=stat["logit_shift_probability"],
-            ls_clip_saturated=stat["ls_clipped_mask"].float(),
-            denominator="n_valid_tokens",
-        )
 
     if "prob_sq_weight" in stat:
         stats_tracker.stat(

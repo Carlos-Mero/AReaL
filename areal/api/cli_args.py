@@ -58,8 +58,10 @@ class NormConfig:
     std_level: str | None = field(
         default="batch",
         metadata={
-            "help": "Standard deviation level for normalization. None for no std normalization.",
-            "choices": ["batch", "group", None],
+            "help": "Standard deviation level for normalization. 'logit-shift' "
+            "enables pre-update-policy reward shaping when used by actor.reward_norm. "
+            "None disables standard deviation scaling.",
+            "choices": ["batch", "group", "logit-shift", None],
         },
     )
     std_unbiased: bool = field(
@@ -81,14 +83,15 @@ class NormConfig:
     def __post_init__(self):
         """Validate normalization configuration."""
         valid_mean_levels = {"batch", "group", "maxrl", None}
-        valid_std_levels = {"batch", "group", None}
+        valid_std_levels = {"batch", "group", "logit-shift", None}
         if self.mean_level not in valid_mean_levels:
             raise ValueError(
                 f"mean_level must be 'batch', 'group', 'maxrl' or None, got {self.mean_level}"
             )
         if self.std_level not in valid_std_levels:
             raise ValueError(
-                f"std_level must be 'batch', 'group', or None, got {self.std_level}"
+                "std_level must be 'batch', 'group', 'logit-shift', or None, "
+                f"got {self.std_level}"
             )
         if (
             self.mean_level in ("group", "maxrl") or self.std_level == "group"
@@ -1482,22 +1485,20 @@ class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
     # Core PPO/GRPO Parameters
-    loss_type: Literal["reinforce", "logit_shift", "prob_sq"] = field(
+    loss_type: Literal["reinforce", "prob_sq"] = field(
         default="reinforce",
         metadata={
             "help": "Actor loss type. 'reinforce' uses the existing PPO/GRPO "
-            "surrogate; 'logit_shift' applies the PPO/GSPO surrogate with a capped "
-            "inverse selected-token probability weight; 'prob_sq' replaces "
-            "log-probability with probability "
+            "surrogate; 'prob_sq' replaces log-probability with probability "
             "and weights it by a detached current-to-proximal importance ratio.",
-            "choices": ["reinforce", "logit_shift", "prob_sq"],
+            "choices": ["reinforce", "prob_sq"],
         },
     )
     ls_clip: float = field(
         default=10.0,
         metadata={
-            "help": "Maximum inverse-probability weight for loss_type='logit_shift'. "
-            "Must be finite and positive."
+            "help": "Maximum inverse pre-update-policy probability reward weight when "
+            "actor.reward_norm.std_level='logit-shift'. Must be finite and positive."
         },
     )
     ppo_n_minibatches: int = field(
@@ -1668,14 +1669,13 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
-        if self.loss_type not in ("reinforce", "logit_shift", "prob_sq"):
+        if self.loss_type not in ("reinforce", "prob_sq"):
             raise ValueError(
-                "loss_type must be 'reinforce', 'logit_shift', or 'prob_sq', "
+                "loss_type must be 'reinforce' or 'prob_sq'; configure logit-shift "
+                "with actor.reward_norm.std_level='logit-shift', "
                 f"got {self.loss_type!r}"
             )
-        if self.loss_type in ("logit_shift", "prob_sq") and (
-            self.use_sapo_loss or self.use_cispo_loss
-        ):
+        if self.loss_type == "prob_sq" and (self.use_sapo_loss or self.use_cispo_loss):
             raise ValueError(
                 f"{self.loss_type} is mutually exclusive with SAPO and CISPO. "
                 "Disable use_sapo_loss and use_cispo_loss."
@@ -1683,6 +1683,21 @@ class PPOActorConfig(TrainEngineConfig):
         if not math.isfinite(self.ls_clip) or self.ls_clip <= 0:
             raise ValueError(
                 f"ls_clip must be finite and positive, got {self.ls_clip!r}"
+            )
+        if self.adv_norm is not None and self.adv_norm.std_level == "logit-shift":
+            raise ValueError(
+                "std_level='logit-shift' is only supported for actor.reward_norm, "
+                "not actor.adv_norm"
+            )
+        if (
+            self.reward_norm is not None
+            and self.reward_norm.std_level == "logit-shift"
+            and not self.should_compute_prox_logp()
+        ):
+            raise ValueError(
+                "actor.reward_norm.std_level='logit-shift' requires a real "
+                "pre-update policy forward. Set actor.recompute_logprob=True, or "
+                "use decoupled PPO with prox_logp_method='recompute' or 'metrics'."
             )
 
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
