@@ -39,6 +39,8 @@ logger = logging.getLogger("CLIArgs")
 
 ConfigT = TypeVar("ConfigT")
 
+_NORM_STD_LEVELS = ("batch", "group", "logit-shift", None)
+
 
 @dataclass
 class NormConfig:
@@ -61,7 +63,7 @@ class NormConfig:
             "help": "Standard deviation level for normalization. 'logit-shift' "
             "enables pre-update-policy reward shaping when used by actor.reward_norm. "
             "None disables standard deviation scaling.",
-            "choices": ["batch", "group", "logit-shift", None],
+            "choices": list(_NORM_STD_LEVELS),
         },
     )
     std_unbiased: bool = field(
@@ -83,12 +85,11 @@ class NormConfig:
     def __post_init__(self):
         """Validate normalization configuration."""
         valid_mean_levels = {"batch", "group", "maxrl", None}
-        valid_std_levels = {"batch", "group", "logit-shift", None}
         if self.mean_level not in valid_mean_levels:
             raise ValueError(
                 f"mean_level must be 'batch', 'group', 'maxrl' or None, got {self.mean_level}"
             )
-        if self.std_level not in valid_std_levels:
+        if self.std_level not in _NORM_STD_LEVELS:
             raise ValueError(
                 "std_level must be 'batch', 'group', 'logit-shift', or None, "
                 f"got {self.std_level}"
