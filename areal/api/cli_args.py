@@ -1487,7 +1487,7 @@ class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
     # Core PPO/GRPO Parameters
-    loss_type: Literal["reinforce", "prob_sq"] = field(
+    loss_type: str = field(
         default="reinforce",
         metadata={
             "help": "Actor loss type. 'reinforce' uses the existing PPO/GRPO "
