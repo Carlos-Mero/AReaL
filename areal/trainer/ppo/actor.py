@@ -58,7 +58,13 @@ class PPOActor:
         self.kl_ctl = config.kl_ctl
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
-        self.adv_norm = Normalization(config.adv_norm) if config.adv_norm else None
+        self.use_logit_shift_advantage = (
+            config.adv_norm is not None and config.adv_norm.std_level == "logit-shift"
+        )
+        adv_norm_config = config.adv_norm
+        if self.use_logit_shift_advantage:
+            adv_norm_config = replace(config.adv_norm, std_level=None)
+        self.adv_norm = Normalization(adv_norm_config) if adv_norm_config else None
         self.use_logit_shift_reward = (
             config.reward_norm is not None
             and config.reward_norm.std_level == "logit-shift"
@@ -132,6 +138,8 @@ class PPOActor:
             logger.info("  reward shaping: logit-shift")
             logger.info("  reward probability: PRE-UPDATE ACTOR FORWARD")
             logger.info(f"  ls_clip: {config.ls_clip}")
+        if self.use_logit_shift_advantage:
+            logger.info("  advantage shaping: logit-shift (1 - group accuracy)")
         logger.info(
             f"  importance_sampling_level: {getattr(config, 'importance_sampling_level', 'token')}"
         )
@@ -158,7 +166,10 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if self.adv_norm is not None and self.adv_norm.mean_level == "maxrl":
+        needs_group_metadata = self.adv_norm is not None and (
+            self.adv_norm.mean_level == "maxrl" or self.use_logit_shift_advantage
+        )
+        if needs_group_metadata:
             batched, meta = concat_batch(data)
             result = self._compute_advantages(
                 batched, adv_group_sizes=meta.traj_group_sizes
@@ -174,6 +185,7 @@ class PPOActor:
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
+        sequence_correct = data["rewards"].detach() > 0
 
         # Reward Penalty on length
         if self.config.overlong_reward_penalty:
@@ -284,6 +296,12 @@ class PPOActor:
             advantages = self.adv_norm(
                 norm_input, loss_mask, group_sizes=adv_group_sizes
             )
+            if self.use_logit_shift_advantage:
+                advantages = self._scale_advantages_by_group_accuracy(
+                    advantages,
+                    sequence_correct,
+                    group_sizes=adv_group_sizes,
+                )
 
         # Store data in the dict.
         data["advantages"] = advantages
@@ -294,6 +312,43 @@ class PPOActor:
         data["logprobs"] = old_logp
 
         return data
+
+    def _scale_advantages_by_group_accuracy(
+        self,
+        advantages: torch.Tensor,
+        sequence_correct: torch.Tensor,
+        group_sizes: list[int] | None,
+    ) -> torch.Tensor:
+        """Scale each group's centered advantages by one minus its accuracy."""
+        bs = advantages.size(0)
+        if sequence_correct.ndim != 1 or sequence_correct.size(0) != bs:
+            raise ValueError(
+                "sequence correctness must have shape [batch_size], "
+                f"got {sequence_correct.shape} for batch size {bs}"
+            )
+
+        if group_sizes is None:
+            assert self.adv_norm is not None
+            group_size = self.adv_norm.group_size
+            group_sizes = [group_size] * (bs // group_size)
+            remainder = bs % group_size
+            if remainder:
+                group_sizes.append(remainder)
+        if any(group_size <= 0 for group_size in group_sizes):
+            raise ValueError(f"group sizes must be positive, got {group_sizes}")
+        if sum(group_sizes) != bs:
+            raise ValueError(
+                f"group sizes must sum to batch size {bs}, got {sum(group_sizes)}"
+            )
+
+        scaled = torch.empty_like(advantages)
+        start = 0
+        for group_size in group_sizes:
+            group_slice = slice(start, start + group_size)
+            start += group_size
+            group_accuracy = sequence_correct[group_slice].float().mean()
+            scaled[group_slice] = advantages[group_slice] * (1.0 - group_accuracy)
+        return scaled
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")

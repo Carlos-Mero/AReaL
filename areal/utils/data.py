@@ -1390,8 +1390,8 @@ class Normalization:
     def __init__(self, config: NormConfig):
         if config.std_level == "logit-shift":
             raise ValueError(
-                "std_level='logit-shift' must be handled by PPOActor reward "
-                "shaping and is not a generic normalization mode"
+                "std_level='logit-shift' must be handled by PPOActor reward or "
+                "advantage shaping and is not a generic normalization mode"
             )
         self.mean_level = config.mean_level
         self.mean_leave1out = config.mean_leave1out

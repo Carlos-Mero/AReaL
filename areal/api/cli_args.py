@@ -61,7 +61,8 @@ class NormConfig:
         default="batch",
         metadata={
             "help": "Standard deviation level for normalization. 'logit-shift' "
-            "enables pre-update-policy reward shaping when used by actor.reward_norm. "
+            "enables pre-update-policy reward shaping for actor.reward_norm, or "
+            "group-accuracy advantage scaling for actor.adv_norm. "
             "None disables standard deviation scaling.",
             "choices": list(_NORM_STD_LEVELS),
         },
@@ -1684,11 +1685,6 @@ class PPOActorConfig(TrainEngineConfig):
         if not math.isfinite(self.ls_clip) or self.ls_clip <= 0:
             raise ValueError(
                 f"ls_clip must be finite and positive, got {self.ls_clip!r}"
-            )
-        if self.adv_norm is not None and self.adv_norm.std_level == "logit-shift":
-            raise ValueError(
-                "std_level='logit-shift' is only supported for actor.reward_norm, "
-                "not actor.adv_norm"
             )
         if (
             self.reward_norm is not None
