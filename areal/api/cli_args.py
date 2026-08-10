@@ -9,7 +9,7 @@ from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 import uvloop
 import yaml
@@ -39,6 +39,7 @@ logger = logging.getLogger("CLIArgs")
 
 ConfigT = TypeVar("ConfigT")
 
+_NORM_MEAN_LEVELS = ("batch", "group", "maxrl", "logit-shift", None)
 _NORM_STD_LEVELS = ("batch", "group", "logit-shift", None)
 
 
@@ -49,8 +50,11 @@ class NormConfig:
     mean_level: str | None = field(
         default="batch",
         metadata={
-            "help": "Mean level for normalization. None for no mean normalization.",
-            "choices": ["batch", "group", "maxrl", None],
+            "help": "Mean level for normalization. 'logit-shift' applies capped "
+            "inverse pre-update-policy probability scaling to each token advantage, "
+            "then centers the scaled valid-token advantages. None disables mean "
+            "normalization.",
+            "choices": list(_NORM_MEAN_LEVELS),
         },
     )
     mean_leave1out: bool = field(
@@ -85,10 +89,10 @@ class NormConfig:
 
     def __post_init__(self):
         """Validate normalization configuration."""
-        valid_mean_levels = {"batch", "group", "maxrl", None}
-        if self.mean_level not in valid_mean_levels:
+        if self.mean_level not in _NORM_MEAN_LEVELS:
             raise ValueError(
-                f"mean_level must be 'batch', 'group', 'maxrl' or None, got {self.mean_level}"
+                "mean_level must be 'batch', 'group', 'maxrl', 'logit-shift', "
+                f"or None, got {self.mean_level}"
             )
         if self.std_level not in _NORM_STD_LEVELS:
             raise ValueError(
@@ -1499,8 +1503,8 @@ class PPOActorConfig(TrainEngineConfig):
     ls_clip: float = field(
         default=10.0,
         metadata={
-            "help": "Maximum inverse pre-update-policy probability reward weight when "
-            "actor.reward_norm.std_level='logit-shift'. Must be finite and positive."
+            "help": "Maximum inverse pre-update-policy probability weight for "
+            "logit-shift reward or advantage shaping. Must be finite and at least 1."
         },
     )
     ppo_n_minibatches: int = field(
@@ -1674,7 +1678,8 @@ class PPOActorConfig(TrainEngineConfig):
         if self.loss_type not in ("reinforce", "prob_sq"):
             raise ValueError(
                 "loss_type must be 'reinforce' or 'prob_sq'; configure logit-shift "
-                "with actor.reward_norm.std_level='logit-shift', "
+                "with actor.adv_norm.mean_level='logit-shift' or "
+                "actor.reward_norm.std_level='logit-shift', "
                 f"got {self.loss_type!r}"
             )
         if self.loss_type == "prob_sq" and (self.use_sapo_loss or self.use_cispo_loss):
@@ -1682,17 +1687,43 @@ class PPOActorConfig(TrainEngineConfig):
                 f"{self.loss_type} is mutually exclusive with SAPO and CISPO. "
                 "Disable use_sapo_loss and use_cispo_loss."
             )
-        if not math.isfinite(self.ls_clip) or self.ls_clip <= 0:
+        if not math.isfinite(self.ls_clip) or self.ls_clip < 1:
             raise ValueError(
-                f"ls_clip must be finite and positive, got {self.ls_clip!r}"
+                f"ls_clip must be finite and at least 1, got {self.ls_clip!r}"
             )
+        use_logit_shift_reward = (
+            self.reward_norm is not None and self.reward_norm.std_level == "logit-shift"
+        )
+        use_logit_shift_advantage = (
+            self.adv_norm is not None and self.adv_norm.mean_level == "logit-shift"
+        )
         if (
             self.reward_norm is not None
-            and self.reward_norm.std_level == "logit-shift"
-            and not self.should_compute_prox_logp()
+            and self.reward_norm.mean_level == "logit-shift"
         ):
             raise ValueError(
-                "actor.reward_norm.std_level='logit-shift' requires a real "
+                "mean_level='logit-shift' is only supported by actor.adv_norm, "
+                "not actor.reward_norm"
+            )
+        if use_logit_shift_advantage and self.adv_norm.mean_leave1out:
+            raise ValueError(
+                "actor.adv_norm.mean_leave1out is not supported when "
+                "mean_level='logit-shift'"
+            )
+        if use_logit_shift_advantage and self.importance_sampling_level != "token":
+            raise ValueError(
+                "actor.adv_norm.mean_level='logit-shift' currently requires "
+                "importance_sampling_level='token'"
+            )
+        if use_logit_shift_reward and use_logit_shift_advantage:
+            raise ValueError(
+                "reward and advantage logit-shift shaping cannot be enabled together"
+            )
+        if (
+            use_logit_shift_reward or use_logit_shift_advantage
+        ) and not self.should_compute_prox_logp():
+            raise ValueError(
+                "logit-shift reward or advantage shaping requires a real "
                 "pre-update policy forward. Set actor.recompute_logprob=True, or "
                 "use decoupled PPO with prox_logp_method='recompute' or 'metrics'."
             )

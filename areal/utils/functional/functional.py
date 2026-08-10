@@ -464,8 +464,8 @@ def logit_shift_reward_shaping(
     The returned tuple contains shaped rewards, masked inverse-probability weights,
     and a mask indicating which valid tokens reached ``ls_clip``.
     """
-    if not math.isfinite(ls_clip) or ls_clip <= 0:
-        raise ValueError(f"ls_clip must be finite and positive, got {ls_clip!r}")
+    if not math.isfinite(ls_clip) or ls_clip < 1:
+        raise ValueError(f"ls_clip must be finite and at least 1, got {ls_clip!r}")
     if rewards.shape != policy_logprobs.shape or rewards.shape != loss_mask.shape:
         raise ValueError(
             "rewards, policy_logprobs, and loss_mask must have identical shapes, "
@@ -486,6 +486,51 @@ def logit_shift_reward_shaping(
     )
     clipped_mask = (-policy_logprobs.detach().float() > log_cap).logical_and(loss_mask)
     return shaped_rewards, weights, clipped_mask
+
+
+def logit_shift_advantage_shaping(
+    advantages: torch.Tensor,
+    policy_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    ls_clip: float = 10.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scale token advantages by inverse policy probability, then center them.
+
+    The probability comes from the fixed pre-update actor policy and is detached.
+    Valid token advantages are first multiplied by
+    ``min(1 / policy_probability, ls_clip) / ls_clip``. The mean of those scaled
+    valid-token advantages is then subtracted, while masked positions remain zero.
+    """
+    if not math.isfinite(ls_clip) or ls_clip < 1:
+        raise ValueError(f"ls_clip must be finite and at least 1, got {ls_clip!r}")
+    if advantages.shape != policy_logprobs.shape or advantages.shape != loss_mask.shape:
+        raise ValueError(
+            "advantages, policy_logprobs, and loss_mask must have identical shapes, "
+            f"got {advantages.shape}, {policy_logprobs.shape}, and {loss_mask.shape}"
+        )
+
+    valid_mask = loss_mask.bool()
+    log_cap = math.log(ls_clip)
+    inverse_probability = torch.exp(
+        torch.clamp(-policy_logprobs.detach().float(), max=log_cap)
+    ).clamp_(min=0.0, max=ls_clip)
+    weights = torch.where(
+        valid_mask, inverse_probability, torch.zeros_like(inverse_probability)
+    )
+    scaled_advantages = torch.where(
+        valid_mask,
+        advantages.float() * weights / ls_clip,
+        torch.zeros_like(advantages, dtype=torch.float32),
+    )
+    valid_count = valid_mask.count_nonzero().clamp(min=1)
+    scaled_mean = (scaled_advantages.double().sum() / valid_count).float()
+    centered_advantages = torch.where(
+        valid_mask,
+        scaled_advantages - scaled_mean,
+        torch.zeros_like(scaled_advantages),
+    )
+    clipped_mask = (-policy_logprobs.detach().float() > log_cap).logical_and(valid_mask)
+    return centered_advantages, weights, clipped_mask
 
 
 def prob_sq_loss_fn(

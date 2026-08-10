@@ -35,6 +35,7 @@ from areal.utils.data import (
 )
 from areal.utils.functional import (
     cispo_loss_fn,
+    logit_shift_advantage_shaping,
     logit_shift_reward_shaping,
     ppo_actor_loss_fn,
     prob_sq_loss_fn,
@@ -59,11 +60,16 @@ class PPOActor:
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
         self.use_logit_shift_advantage = (
+            config.adv_norm is not None and config.adv_norm.mean_level == "logit-shift"
+        )
+        self.use_logit_shift_group_accuracy = (
             config.adv_norm is not None and config.adv_norm.std_level == "logit-shift"
         )
         adv_norm_config = config.adv_norm
         if self.use_logit_shift_advantage:
-            adv_norm_config = replace(config.adv_norm, std_level=None)
+            adv_norm_config = replace(adv_norm_config, mean_level=None)
+        if self.use_logit_shift_group_accuracy:
+            adv_norm_config = replace(adv_norm_config, std_level=None)
         self.adv_norm = Normalization(adv_norm_config) if adv_norm_config else None
         self.use_logit_shift_reward = (
             config.reward_norm is not None
@@ -139,7 +145,12 @@ class PPOActor:
             logger.info("  reward probability: PRE-UPDATE ACTOR FORWARD")
             logger.info(f"  ls_clip: {config.ls_clip}")
         if self.use_logit_shift_advantage:
-            logger.info("  advantage shaping: logit-shift (1 - group accuracy)")
+            logger.info(
+                "  advantage shaping: per-token inverse-probability logit-shift"
+            )
+            logger.info(f"  ls_clip: {config.ls_clip}")
+        if self.use_logit_shift_group_accuracy:
+            logger.info("  advantage std shaping: logit-shift (1 - group accuracy)")
         logger.info(
             f"  importance_sampling_level: {getattr(config, 'importance_sampling_level', 'token')}"
         )
@@ -167,7 +178,7 @@ class PPOActor:
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         needs_group_metadata = self.adv_norm is not None and (
-            self.adv_norm.mean_level == "maxrl" or self.use_logit_shift_advantage
+            self.adv_norm.mean_level == "maxrl" or self.use_logit_shift_group_accuracy
         )
         if needs_group_metadata:
             batched, meta = concat_batch(data)
@@ -213,10 +224,14 @@ class PPOActor:
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
         behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
-        policy_logp = data.get("prox_logp") if self.use_logit_shift_reward else None
-        if self.use_logit_shift_reward and policy_logp is None:
+        needs_policy_logp = (
+            self.use_logit_shift_reward or self.use_logit_shift_advantage
+        )
+        policy_logp = data.get("prox_logp") if needs_policy_logp else None
+        if needs_policy_logp and policy_logp is None:
             raise ValueError(
-                "prox_logp is required for logit-shift reward shaping. Enable a "
+                "prox_logp is required for logit-shift reward or advantage shaping. "
+                "Enable a "
                 "real policy log-probability recompute before computing advantages."
             )
         # Apply the mask to log probabilities.
@@ -290,13 +305,30 @@ class PPOActor:
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         data["returns"] = advantages + values
 
+        if self.use_logit_shift_advantage:
+            assert policy_logp is not None
+            (
+                advantages,
+                logit_shift_advantage_weight,
+                logit_shift_advantage_clipped_mask,
+            ) = logit_shift_advantage_shaping(
+                advantages=advantages,
+                policy_logprobs=policy_logp,
+                loss_mask=loss_mask,
+                ls_clip=self.config.ls_clip,
+            )
+            data["logit_shift_advantage_weight"] = logit_shift_advantage_weight
+            data["logit_shift_advantage_clipped_mask"] = (
+                logit_shift_advantage_clipped_mask
+            )
+
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
             norm_input = rewards if self.adv_norm.mean_level == "maxrl" else advantages
             advantages = self.adv_norm(
                 norm_input, loss_mask, group_sizes=adv_group_sizes
             )
-            if self.use_logit_shift_advantage:
+            if self.use_logit_shift_group_accuracy:
                 advantages = self._scale_advantages_by_group_accuracy(
                     advantages,
                     sequence_correct,
@@ -401,6 +433,13 @@ class PPOActor:
                 "logit_shift_reward_weight"
             ].float()
             stats["ls_clip_saturated"] = data["ls_clipped_mask"].float()
+        if "logit_shift_advantage_weight" in data:
+            stats["logit_shift_advantage_weight"] = data[
+                "logit_shift_advantage_weight"
+            ].float()
+            stats["logit_shift_advantage_clip_saturated"] = data[
+                "logit_shift_advantage_clipped_mask"
+            ].float()
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
@@ -415,7 +454,7 @@ class PPOActor:
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
         )
-        if self.use_logit_shift_reward:
+        if self.use_logit_shift_reward or self.use_logit_shift_advantage:
             scalars["ls_clip"] = self.config.ls_clip
         if self.config.c_clip is not None:
             scalars["c_clip"] = self.config.c_clip
@@ -448,6 +487,8 @@ class PPOActor:
             "kl_rewards",
             "logit_shift_reward_weight",
             "ls_clipped_mask",
+            "logit_shift_advantage_weight",
+            "logit_shift_advantage_clipped_mask",
         ]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
