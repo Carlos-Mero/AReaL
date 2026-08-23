@@ -39,7 +39,14 @@ logger = logging.getLogger("CLIArgs")
 
 ConfigT = TypeVar("ConfigT")
 
-_NORM_MEAN_LEVELS = ("batch", "group", "maxrl", "logit-shift", None)
+_NORM_MEAN_LEVELS = (
+    "batch",
+    "group",
+    "maxrl",
+    "logit-shift",
+    "logit-shift-legacy",
+    None,
+)
 _NORM_STD_LEVELS = ("batch", "group", "logit-shift", None)
 
 
@@ -51,9 +58,9 @@ class NormConfig:
         default="batch",
         metadata={
             "help": "Mean level for normalization. 'logit-shift' applies capped "
-            "inverse pre-update-policy probability scaling to each token advantage, "
-            "then centers the scaled valid-token advantages. None disables mean "
-            "normalization.",
+            "inverse pre-update-policy probability scaling to each token advantage. "
+            "'logit-shift-legacy' additionally centers the scaled valid-token "
+            "advantages. None disables mean normalization.",
             "choices": list(_NORM_MEAN_LEVELS),
         },
     )
@@ -92,7 +99,7 @@ class NormConfig:
         if self.mean_level not in _NORM_MEAN_LEVELS:
             raise ValueError(
                 "mean_level must be 'batch', 'group', 'maxrl', 'logit-shift', "
-                f"or None, got {self.mean_level}"
+                f"'logit-shift-legacy', or None, got {self.mean_level}"
             )
         if self.std_level not in _NORM_STD_LEVELS:
             raise ValueError(
@@ -1694,25 +1701,26 @@ class PPOActorConfig(TrainEngineConfig):
         use_logit_shift_reward = (
             self.reward_norm is not None and self.reward_norm.std_level == "logit-shift"
         )
-        use_logit_shift_advantage = (
-            self.adv_norm is not None and self.adv_norm.mean_level == "logit-shift"
+        use_logit_shift_advantage = self.adv_norm is not None and (
+            self.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy")
         )
-        if (
-            self.reward_norm is not None
-            and self.reward_norm.mean_level == "logit-shift"
+        if self.reward_norm is not None and self.reward_norm.mean_level in (
+            "logit-shift",
+            "logit-shift-legacy",
         ):
             raise ValueError(
-                "mean_level='logit-shift' is only supported by actor.adv_norm, "
-                "not actor.reward_norm"
+                f"mean_level={self.reward_norm.mean_level!r} is only supported by "
+                "actor.adv_norm, not actor.reward_norm"
             )
         if use_logit_shift_advantage and self.adv_norm.mean_leave1out:
             raise ValueError(
                 "actor.adv_norm.mean_leave1out is not supported when "
-                "mean_level='logit-shift'"
+                "mean_level is 'logit-shift' or 'logit-shift-legacy'"
             )
         if use_logit_shift_advantage and self.importance_sampling_level != "token":
             raise ValueError(
-                "actor.adv_norm.mean_level='logit-shift' currently requires "
+                "actor.adv_norm.mean_level='logit-shift' or "
+                "'logit-shift-legacy' currently requires "
                 "importance_sampling_level='token'"
             )
         if use_logit_shift_reward and use_logit_shift_advantage:

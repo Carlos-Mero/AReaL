@@ -59,8 +59,12 @@ class PPOActor:
         self.kl_ctl = config.kl_ctl
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
-        self.use_logit_shift_advantage = (
-            config.adv_norm is not None and config.adv_norm.mean_level == "logit-shift"
+        self.use_logit_shift_advantage = config.adv_norm is not None and (
+            config.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy")
+        )
+        self.use_logit_shift_legacy = (
+            config.adv_norm is not None
+            and config.adv_norm.mean_level == "logit-shift-legacy"
         )
         self.use_logit_shift_group_accuracy = (
             config.adv_norm is not None and config.adv_norm.std_level == "logit-shift"
@@ -147,6 +151,9 @@ class PPOActor:
         if self.use_logit_shift_advantage:
             logger.info(
                 "  advantage shaping: per-token inverse-probability logit-shift"
+            )
+            logger.info(
+                f"  advantage centering: {'legacy global mean' if self.use_logit_shift_legacy else 'disabled'}"
             )
             logger.info(f"  ls_clip: {config.ls_clip}")
         if self.use_logit_shift_group_accuracy:
@@ -316,6 +323,7 @@ class PPOActor:
                 policy_logprobs=policy_logp,
                 loss_mask=loss_mask,
                 ls_clip=self.config.ls_clip,
+                center=self.use_logit_shift_legacy,
             )
             data["logit_shift_advantage_weight"] = logit_shift_advantage_weight
             data["logit_shift_advantage_clipped_mask"] = (

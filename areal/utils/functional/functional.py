@@ -493,13 +493,15 @@ def logit_shift_advantage_shaping(
     policy_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     ls_clip: float = 10.0,
+    center: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Scale token advantages by inverse policy probability, then center them.
+    """Scale token advantages by inverse policy probability.
 
     The probability comes from the fixed pre-update actor policy and is detached.
     Valid token advantages are first multiplied by
-    ``min(1 / policy_probability, ls_clip) / ls_clip``. The mean of those scaled
-    valid-token advantages is then subtracted, while masked positions remain zero.
+    ``min(1 / policy_probability, ls_clip) / ls_clip``. When ``center`` is true,
+    the mean of those scaled valid-token advantages is then subtracted to preserve
+    the legacy logit-shift behavior. Masked positions remain zero in either mode.
     """
     if not math.isfinite(ls_clip) or ls_clip < 1:
         raise ValueError(f"ls_clip must be finite and at least 1, got {ls_clip!r}")
@@ -522,15 +524,16 @@ def logit_shift_advantage_shaping(
         advantages.float() * weights / ls_clip,
         torch.zeros_like(advantages, dtype=torch.float32),
     )
-    valid_count = valid_mask.count_nonzero().clamp(min=1)
-    scaled_mean = (scaled_advantages.double().sum() / valid_count).float()
-    centered_advantages = torch.where(
-        valid_mask,
-        scaled_advantages - scaled_mean,
-        torch.zeros_like(scaled_advantages),
-    )
+    if center:
+        valid_count = valid_mask.count_nonzero().clamp(min=1)
+        scaled_mean = (scaled_advantages.double().sum() / valid_count).float()
+        scaled_advantages = torch.where(
+            valid_mask,
+            scaled_advantages - scaled_mean,
+            torch.zeros_like(scaled_advantages),
+        )
     clipped_mask = (-policy_logprobs.detach().float() > log_cap).logical_and(valid_mask)
-    return centered_advantages, weights, clipped_mask
+    return scaled_advantages, weights, clipped_mask
 
 
 def prob_sq_loss_fn(
