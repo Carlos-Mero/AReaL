@@ -60,7 +60,11 @@ class PPOActor:
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
         self.use_logit_shift_advantage = config.adv_norm is not None and (
-            config.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy")
+            config.adv_norm.mean_level
+            in ("logit-shift", "logit-shift-legacy", "maxls")
+        )
+        self.use_maxls = (
+            config.adv_norm is not None and config.adv_norm.mean_level == "maxls"
         )
         self.use_logit_shift_legacy = (
             config.adv_norm is not None
@@ -70,7 +74,9 @@ class PPOActor:
             config.adv_norm is not None and config.adv_norm.std_level == "logit-shift"
         )
         adv_norm_config = config.adv_norm
-        if self.use_logit_shift_advantage:
+        if self.use_maxls:
+            adv_norm_config = replace(adv_norm_config, mean_level="maxrl")
+        elif self.use_logit_shift_advantage:
             adv_norm_config = replace(adv_norm_config, mean_level=None)
         if self.use_logit_shift_group_accuracy:
             adv_norm_config = replace(adv_norm_config, std_level=None)
@@ -149,9 +155,15 @@ class PPOActor:
             logger.info("  reward probability: PRE-UPDATE ACTOR FORWARD")
             logger.info(f"  ls_clip: {config.ls_clip}")
         if self.use_logit_shift_advantage:
-            logger.info(
-                "  advantage shaping: per-token inverse-probability logit-shift"
-            )
+            if self.use_maxls:
+                logger.info(
+                    "  advantage shaping: MaxRL group advantage followed by "
+                    "per-token inverse-probability logit-shift"
+                )
+            else:
+                logger.info(
+                    "  advantage shaping: per-token inverse-probability logit-shift"
+                )
             logger.info(
                 f"  advantage centering: {'legacy global mean' if self.use_logit_shift_legacy else 'disabled'}"
             )
@@ -185,7 +197,9 @@ class PPOActor:
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
         needs_group_metadata = self.adv_norm is not None and (
-            self.adv_norm.mean_level == "maxrl" or self.use_logit_shift_group_accuracy
+            self.adv_norm.mean_level == "maxrl"
+            or self.use_maxls
+            or self.use_logit_shift_group_accuracy
         )
         if needs_group_metadata:
             batched, meta = concat_batch(data)
@@ -312,7 +326,7 @@ class PPOActor:
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         data["returns"] = advantages + values
 
-        if self.use_logit_shift_advantage:
+        if self.use_logit_shift_advantage and not self.use_maxls:
             assert policy_logp is not None
             (
                 advantages,
@@ -336,6 +350,24 @@ class PPOActor:
             advantages = self.adv_norm(
                 norm_input, loss_mask, group_sizes=adv_group_sizes
             )
+            if self.use_maxls:
+                assert policy_logp is not None
+                (
+                    advantages,
+                    logit_shift_advantage_weight,
+                    logit_shift_advantage_clipped_mask,
+                ) = logit_shift_advantage_shaping(
+                    advantages=advantages,
+                    policy_logprobs=policy_logp,
+                    loss_mask=loss_mask,
+                    ls_clip=self.config.ls_clip,
+                )
+                data["logit_shift_advantage_weight"] = (
+                    logit_shift_advantage_weight
+                )
+                data["logit_shift_advantage_clipped_mask"] = (
+                    logit_shift_advantage_clipped_mask
+                )
             if self.use_logit_shift_group_accuracy:
                 advantages = self._scale_advantages_by_group_accuracy(
                     advantages,

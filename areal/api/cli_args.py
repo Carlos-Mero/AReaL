@@ -43,6 +43,7 @@ _NORM_MEAN_LEVELS = (
     "batch",
     "group",
     "maxrl",
+    "maxls",
     "logit-shift",
     "logit-shift-legacy",
     None,
@@ -60,7 +61,8 @@ class NormConfig:
             "help": "Mean level for normalization. 'logit-shift' applies capped "
             "inverse pre-update-policy probability scaling to each token advantage. "
             "'logit-shift-legacy' additionally centers the scaled valid-token "
-            "advantages. None disables mean normalization.",
+            "advantages. 'maxls' applies MaxRL group advantages followed by "
+            "non-centered logit-shift scaling. None disables mean normalization.",
             "choices": list(_NORM_MEAN_LEVELS),
         },
     )
@@ -91,15 +93,19 @@ class NormConfig:
         },
     )
     group_size: int = field(
-        default=1, metadata={"help": "Group size for group-level normalization"}
+        default=1,
+        metadata={
+            "help": "Group size for group-level normalization and MaxRL/MaxLS"
+        },
     )
 
     def __post_init__(self):
         """Validate normalization configuration."""
         if self.mean_level not in _NORM_MEAN_LEVELS:
             raise ValueError(
-                "mean_level must be 'batch', 'group', 'maxrl', 'logit-shift', "
-                f"'logit-shift-legacy', or None, got {self.mean_level}"
+                "mean_level must be 'batch', 'group', 'maxrl', 'maxls', "
+                "'logit-shift', 'logit-shift-legacy', or None, "
+                f"got {self.mean_level}"
             )
         if self.std_level not in _NORM_STD_LEVELS:
             raise ValueError(
@@ -107,7 +113,8 @@ class NormConfig:
                 f"got {self.std_level}"
             )
         if (
-            self.mean_level in ("group", "maxrl") or self.std_level == "group"
+            self.mean_level in ("group", "maxrl", "maxls")
+            or self.std_level == "group"
         ) and self.group_size < 1:
             raise ValueError(
                 f"group_size must be a positive integer when using group normalization, got {self.group_size}"
@@ -1702,11 +1709,13 @@ class PPOActorConfig(TrainEngineConfig):
             self.reward_norm is not None and self.reward_norm.std_level == "logit-shift"
         )
         use_logit_shift_advantage = self.adv_norm is not None and (
-            self.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy")
+            self.adv_norm.mean_level
+            in ("logit-shift", "logit-shift-legacy", "maxls")
         )
         if self.reward_norm is not None and self.reward_norm.mean_level in (
             "logit-shift",
             "logit-shift-legacy",
+            "maxls",
         ):
             raise ValueError(
                 f"mean_level={self.reward_norm.mean_level!r} is only supported by "
@@ -1715,12 +1724,21 @@ class PPOActorConfig(TrainEngineConfig):
         if use_logit_shift_advantage and self.adv_norm.mean_leave1out:
             raise ValueError(
                 "actor.adv_norm.mean_leave1out is not supported when "
-                "mean_level is 'logit-shift' or 'logit-shift-legacy'"
+                "mean_level is 'logit-shift', 'logit-shift-legacy', or 'maxls'"
+            )
+        if (
+            self.adv_norm is not None
+            and self.adv_norm.mean_level == "maxls"
+            and self.adv_norm.std_level is not None
+        ):
+            raise ValueError(
+                "actor.adv_norm.std_level must be None when mean_level='maxls'; "
+                "MaxLS is defined as MaxRL followed only by logit-shift scaling"
             )
         if use_logit_shift_advantage and self.importance_sampling_level != "token":
             raise ValueError(
-                "actor.adv_norm.mean_level='logit-shift' or "
-                "'logit-shift-legacy' currently requires "
+                "actor.adv_norm.mean_level='logit-shift', "
+                "'logit-shift-legacy', or 'maxls' currently requires "
                 "importance_sampling_level='token'"
             )
         if use_logit_shift_reward and use_logit_shift_advantage:
