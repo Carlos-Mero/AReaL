@@ -165,7 +165,16 @@ class PPOActor:
                     "  advantage shaping: per-token inverse-probability logit-shift"
                 )
             logger.info(
-                f"  advantage centering: {'legacy global mean' if self.use_logit_shift_legacy else 'disabled'}"
+                "  advantage centering: "
+                + (
+                    "legacy batch-wide mean over all valid tokens"
+                    if self.use_logit_shift_legacy
+                    else (
+                        "per-sequence mean over non-final valid tokens"
+                        if self.use_maxls
+                        else "batch-wide mean over non-final valid tokens"
+                    )
+                )
             )
             logger.info(f"  ls_clip: {config.ls_clip}")
         if self.use_logit_shift_group_accuracy:
@@ -337,7 +346,9 @@ class PPOActor:
                 policy_logprobs=policy_logp,
                 loss_mask=loss_mask,
                 ls_clip=self.config.ls_clip,
-                center=self.use_logit_shift_legacy,
+                centering=(
+                    "all" if self.use_logit_shift_legacy else "exclude-last"
+                ),
             )
             data["logit_shift_advantage_weight"] = logit_shift_advantage_weight
             data["logit_shift_advantage_clipped_mask"] = (
@@ -361,6 +372,7 @@ class PPOActor:
                     policy_logprobs=policy_logp,
                     loss_mask=loss_mask,
                     ls_clip=self.config.ls_clip,
+                    centering="exclude-last-per-sequence",
                 )
                 data["logit_shift_advantage_weight"] = (
                     logit_shift_advantage_weight

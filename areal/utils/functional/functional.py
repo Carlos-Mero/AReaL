@@ -3,7 +3,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -493,15 +493,28 @@ def logit_shift_advantage_shaping(
     policy_logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
     ls_clip: float = 10.0,
-    center: bool = False,
+    center: bool | None = None,
+    *,
+    centering: Literal[
+        "exclude-last",
+        "exclude-last-per-sequence",
+        "all",
+        "none",
+    ] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Scale token advantages by inverse policy probability.
+    """Scale token advantages and optionally center non-final tokens.
 
     The probability comes from the fixed pre-update actor policy and is detached.
     Valid token advantages are first multiplied by
-    ``min(1 / policy_probability, ls_clip) / ls_clip``. When ``center`` is true,
-    the mean of those scaled valid-token advantages is then subtracted to preserve
-    the legacy logit-shift behavior. Masked positions remain zero in either mode.
+    ``min(1 / policy_probability, ls_clip) / ls_clip``. By default, one batch-wide
+    mean is computed over valid non-final tokens and subtracted only from those
+    tokens. The final valid token in each sequence neither contributes to that mean
+    nor has it subtracted. Use ``centering="all"`` to reproduce the legacy behavior
+    of centering every valid token, or ``centering="none"`` to skip centering.
+    Masked positions remain zero. The old ``center`` argument remains supported:
+    ``True`` maps to ``"all"`` and ``False`` maps to ``"none"``. The
+    ``"exclude-last-per-sequence"`` mode computes a separate non-final mean along
+    the last dimension for each sequence.
     """
     if not math.isfinite(ls_clip) or ls_clip < 1:
         raise ValueError(f"ls_clip must be finite and at least 1, got {ls_clip!r}")
@@ -509,6 +522,24 @@ def logit_shift_advantage_shaping(
         raise ValueError(
             "advantages, policy_logprobs, and loss_mask must have identical shapes, "
             f"got {advantages.shape}, {policy_logprobs.shape}, and {loss_mask.shape}"
+        )
+    if center is not None and centering is not None:
+        raise ValueError("center and centering cannot be specified together")
+    if centering is None:
+        centering = (
+            "exclude-last" if center is None else ("all" if center else "none")
+        )
+    valid_centering_modes = (
+        "exclude-last",
+        "exclude-last-per-sequence",
+        "all",
+        "none",
+    )
+    if centering not in valid_centering_modes:
+        raise ValueError(
+            "centering must be 'exclude-last', 'exclude-last-per-sequence', "
+            "'all', or 'none', "
+            f"got {centering!r}"
         )
 
     valid_mask = loss_mask.bool()
@@ -524,13 +555,31 @@ def logit_shift_advantage_shaping(
         advantages.float() * weights / ls_clip,
         torch.zeros_like(advantages, dtype=torch.float32),
     )
-    if center:
-        valid_count = valid_mask.count_nonzero().clamp(min=1)
-        scaled_mean = (scaled_advantages.double().sum() / valid_count).float()
+    if centering != "none":
+        centering_mask = valid_mask
+        if centering in ("exclude-last", "exclude-last-per-sequence"):
+            valid_counts = valid_mask.sum(dim=-1, keepdim=True)
+            last_token_mask = valid_mask.logical_and(
+                valid_mask.cumsum(dim=-1) == valid_counts
+            )
+            centering_mask = valid_mask.logical_and(~last_token_mask)
+        centered_values = torch.where(
+            centering_mask,
+            scaled_advantages.double(),
+            torch.zeros_like(scaled_advantages, dtype=torch.float64),
+        )
+        if centering == "exclude-last-per-sequence":
+            centered_count = centering_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+            scaled_mean = (
+                centered_values.sum(dim=-1, keepdim=True) / centered_count
+            ).float()
+        else:
+            centered_count = centering_mask.count_nonzero().clamp(min=1)
+            scaled_mean = (centered_values.sum() / centered_count).float()
         scaled_advantages = torch.where(
-            valid_mask,
+            centering_mask,
             scaled_advantages - scaled_mean,
-            torch.zeros_like(scaled_advantages),
+            scaled_advantages,
         )
     clipped_mask = (-policy_logprobs.detach().float() > log_cap).logical_and(valid_mask)
     return scaled_advantages, weights, clipped_mask

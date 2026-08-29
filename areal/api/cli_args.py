@@ -59,10 +59,12 @@ class NormConfig:
         default="batch",
         metadata={
             "help": "Mean level for normalization. 'logit-shift' applies capped "
-            "inverse pre-update-policy probability scaling to each token advantage. "
-            "'logit-shift-legacy' additionally centers the scaled valid-token "
-            "advantages. 'maxls' applies MaxRL group advantages followed by "
-            "non-centered logit-shift scaling. None disables mean normalization.",
+            "inverse pre-update-policy probability scaling, then centers non-final "
+            "token advantages while preserving each sequence's final token. "
+            "'logit-shift-legacy' centers all scaled valid-token advantages. "
+            "'maxls' applies MaxRL group advantages followed by the new logit-shift "
+            "scaling and per-sequence non-final-token centering. None disables mean "
+            "normalization.",
             "choices": list(_NORM_MEAN_LEVELS),
         },
     )
@@ -1733,7 +1735,8 @@ class PPOActorConfig(TrainEngineConfig):
         ):
             raise ValueError(
                 "actor.adv_norm.std_level must be None when mean_level='maxls'; "
-                "MaxLS is defined as MaxRL followed only by logit-shift scaling"
+                "MaxLS is defined as MaxRL followed by per-sequence, "
+                "final-token-preserving logit-shift shaping"
             )
         if use_logit_shift_advantage and self.importance_sampling_level != "token":
             raise ValueError(
