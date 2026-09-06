@@ -37,6 +37,7 @@ from areal.utils.functional import (
     cispo_loss_fn,
     logit_shift_advantage_shaping,
     logit_shift_reward_shaping,
+    ls_refined_loss_fn,
     ppo_actor_loss_fn,
     prob_sq_loss_fn,
     reward_overlong_penalty,
@@ -70,13 +71,16 @@ class PPOActor:
             config.adv_norm is not None
             and config.adv_norm.mean_level == "logit-shift-legacy"
         )
+        self.use_ls_refined = (
+            config.adv_norm is not None and config.adv_norm.mean_level == "ls-refined"
+        )
         self.use_logit_shift_group_accuracy = (
             config.adv_norm is not None and config.adv_norm.std_level == "logit-shift"
         )
         adv_norm_config = config.adv_norm
         if self.use_maxls:
             adv_norm_config = replace(adv_norm_config, mean_level="maxrl")
-        elif self.use_logit_shift_advantage:
+        elif self.use_logit_shift_advantage or self.use_ls_refined:
             adv_norm_config = replace(adv_norm_config, mean_level=None)
         if self.use_logit_shift_group_accuracy:
             adv_norm_config = replace(adv_norm_config, std_level=None)
@@ -150,6 +154,12 @@ class PPOActor:
         logger.info("=" * 70)
         logger.info("Training Parameters:")
         logger.info(f"  loss_type: {config.loss_type}")
+        if self.use_ls_refined:
+            logger.info("  loss correction: ls-refined additive log-barrier")
+            logger.info("  correction probability: PRE-UPDATE ACTOR FORWARD")
+            logger.info("  correction normalization: full model vocabulary size")
+            logger.info(f"  ls_strength: {config.ls_strength}")
+            logger.info(f"  ls_clip: {config.ls_clip}")
         if self.use_logit_shift_reward:
             logger.info("  reward shaping: logit-shift")
             logger.info("  reward probability: PRE-UPDATE ACTOR FORWARD")
@@ -255,12 +265,14 @@ class PPOActor:
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
         behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
         needs_policy_logp = (
-            self.use_logit_shift_reward or self.use_logit_shift_advantage
+            self.use_logit_shift_reward
+            or self.use_logit_shift_advantage
+            or self.use_ls_refined
         )
         policy_logp = data.get("prox_logp") if needs_policy_logp else None
         if needs_policy_logp and policy_logp is None:
             raise ValueError(
-                "prox_logp is required for logit-shift reward or advantage shaping. "
+                "prox_logp is required for logit-shift shaping or ls-refined. "
                 "Enable a "
                 "real policy log-probability recompute before computing advantages."
             )
@@ -397,6 +409,24 @@ class PPOActor:
 
         return data
 
+    def _get_ls_vocab_size(self) -> int:
+        """Read the global output vocabulary after the training engine initializes."""
+        model_config = getattr(self.engine, "model_config", None)
+        if model_config is None:
+            model_config = getattr(self.engine, "hf_config", None)
+        text_config = getattr(model_config, "text_config", model_config)
+        vocab_size = getattr(text_config, "vocab_size", None)
+        if (
+            not isinstance(vocab_size, int)
+            or isinstance(vocab_size, bool)
+            or vocab_size < 1
+        ):
+            raise ValueError(
+                "ls-refined requires the initialized engine's model_config or "
+                "hf_config to provide a positive language-model vocab_size"
+            )
+        return vocab_size
+
     def _scale_advantages_by_group_accuracy(
         self,
         advantages: torch.Tensor,
@@ -444,6 +474,7 @@ class PPOActor:
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
         seqlens = attn_mask.sum(-1)
+        ls_vocab_size = self._get_ls_vocab_size() if self.use_ls_refined else None
 
         ########## Logging code starts ##########
         result_denominators = {
@@ -506,8 +537,15 @@ class PPOActor:
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
         )
-        if self.use_logit_shift_reward or self.use_logit_shift_advantage:
+        if (
+            self.use_logit_shift_reward
+            or self.use_logit_shift_advantage
+            or self.use_ls_refined
+        ):
             scalars["ls_clip"] = self.config.ls_clip
+        if self.use_ls_refined:
+            scalars["ls_strength"] = self.config.ls_strength
+            scalars["ls_vocab_size"] = ls_vocab_size
         if self.config.c_clip is not None:
             scalars["c_clip"] = self.config.c_clip
             scalars["use_dual_clip"] = 1
@@ -573,6 +611,10 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        use_ls_refined=self.use_ls_refined,
+                        ls_strength=self.config.ls_strength,
+                        ls_clip=self.config.ls_clip,
+                        ls_vocab_size=ls_vocab_size,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -639,6 +681,10 @@ def grpo_loss_fn(
     use_decoupled_loss: bool = False,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    use_ls_refined: bool = False,
+    ls_strength: float = 1.0,
+    ls_clip: float = 10.0,
+    ls_vocab_size: int | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -665,7 +711,32 @@ def grpo_loss_fn(
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
     # Use a direct actor loss, CISPO, SAPO, or PPO loss.
-    if loss_type == "prob_sq":
+    if use_ls_refined:
+        if loss_type != "reinforce" or use_cispo_loss or use_sapo_loss:
+            raise ValueError(
+                "ls-refined requires loss_type='reinforce' with SAPO and CISPO disabled"
+            )
+        if prox_logp_gt is None:
+            raise ValueError("ls-refined requires pre-update policy log-probabilities")
+        if ls_vocab_size is None:
+            raise ValueError("ls-refined requires the full model vocabulary size")
+        loss, stat = ls_refined_loss_fn(
+            logprobs=logprobs,
+            proximal_logprobs=prox_logp,
+            old_logprobs=old_logp,
+            advantages=advantages,
+            eps_clip=eps_clip,
+            eps_clip_higher=eps_clip_higher,
+            c_clip=c_clip,
+            loss_mask=loss_mask,
+            vocab_size=ls_vocab_size,
+            ls_strength=ls_strength,
+            ls_clip=ls_clip,
+            rejection_sampling=rejection_sampling,
+            importance_sampling_level=importance_sampling_level,
+            cu_seqlens=input_data.get("cu_seqlens"),
+        )
+    elif loss_type == "prob_sq":
         if use_cispo_loss or use_sapo_loss:
             raise ValueError(
                 "prob_sq is mutually exclusive with SAPO and CISPO. "
@@ -840,6 +911,15 @@ def grpo_loss_fn(
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
+
+    if "ls_refined_weight" in stat:
+        stats_tracker.stat(
+            ls_refined_weight=stat["ls_refined_weight"],
+            ls_refined_correction=stat["ls_refined_correction"],
+            ls_refined_barrier_loss=stat["ls_refined_barrier_loss"],
+            ls_refined_clip_saturated=stat["ls_refined_clip_saturated"].float(),
+            denominator="n_valid_tokens",
+        )
 
     if "prob_sq_weight" in stat:
         stats_tracker.stat(

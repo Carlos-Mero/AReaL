@@ -1388,7 +1388,12 @@ class Normalization:
     """
 
     def __init__(self, config: NormConfig):
-        if config.mean_level in ("logit-shift", "logit-shift-legacy", "maxls"):
+        if config.mean_level in (
+            "logit-shift",
+            "logit-shift-legacy",
+            "maxls",
+            "ls-refined",
+        ):
             raise ValueError(
                 f"mean_level={config.mean_level!r} must be handled by PPOActor "
                 "advantage shaping and is not a generic normalization mode"

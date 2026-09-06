@@ -810,6 +810,102 @@ def ppo_actor_loss_fn(
     return pg_loss, stat
 
 
+def ls_refined_loss_fn(
+    logprobs: torch.Tensor,
+    proximal_logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    loss_mask: torch.Tensor,
+    vocab_size: int,
+    ls_strength: float = 1.0,
+    ls_clip: float = 10.0,
+    eps_clip_higher: float | None = None,
+    c_clip: float | None = None,
+    rejection_sampling: RejectionSamplingConfig | None = None,
+    importance_sampling_level: str = "token",
+    cu_seqlens: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict]:
+    """Add a sampled log-barrier to the existing REINFORCE/PPO surrogate.
+
+    The additional per-token loss is
+    ``-ls_strength / vocab_size * min(1 / p_prox, ls_clip) * log(p_theta)``.
+    Its coefficient is detached, independent of advantage, and applies to every
+    valid token including the final token. Unlike logit-shift advantage shaping,
+    it is neither centered nor divided by ``ls_clip``. Advantage normalization
+    happens in the actor before this function.
+
+    PPO ratio/dual clipping only affects the original policy loss. The barrier
+    is a separate additive term, not part of the clipped advantage. Both terms
+    respect the same rejection-sampling masks and behavior importance weights.
+    Only sampled-token log probabilities and the full model vocabulary size
+    are needed; no full logits or vocabulary entropy is materialized.
+    """
+    if (
+        not isinstance(vocab_size, int)
+        or isinstance(vocab_size, bool)
+        or vocab_size < 1
+    ):
+        raise ValueError(f"vocab_size must be a positive integer, got {vocab_size!r}")
+    if not math.isfinite(ls_strength) or ls_strength < 0:
+        raise ValueError(
+            f"ls_strength must be finite and nonnegative, got {ls_strength!r}"
+        )
+    if not math.isfinite(ls_clip) or ls_clip < 1:
+        raise ValueError(f"ls_clip must be finite and at least 1, got {ls_clip!r}")
+    if importance_sampling_level != "token":
+        raise ValueError("ls-refined requires importance_sampling_level='token'")
+    if not (
+        logprobs.shape == proximal_logprobs.shape == advantages.shape == loss_mask.shape
+    ):
+        raise ValueError(
+            "logprobs, proximal_logprobs, advantages, and loss_mask "
+            "must have identical shapes"
+        )
+
+    proximal_logprobs = proximal_logprobs.detach()
+    loss, stat = ppo_actor_loss_fn(
+        logprobs=logprobs,
+        proximal_logprobs=proximal_logprobs,
+        old_logprobs=old_logprobs.detach(),
+        advantages=advantages.detach(),
+        eps_clip=eps_clip,
+        eps_clip_higher=eps_clip_higher,
+        c_clip=c_clip,
+        loss_mask=loss_mask,
+        rejection_sampling=rejection_sampling,
+        importance_sampling_level=importance_sampling_level,
+        cu_seqlens=cu_seqlens,
+    )
+
+    valid_mask = loss_mask.bool()
+    if "behave_mask" in stat:
+        valid_mask = valid_mask & stat["behave_mask"]
+    log_cap = math.log(ls_clip)
+    inverse_logprobs = torch.where(valid_mask, -proximal_logprobs.float(), 0.0)
+    inverse_probability = torch.exp(
+        torch.clamp(inverse_logprobs, max=log_cap)
+    ).clamp_(min=0.0, max=ls_clip)
+    weights = torch.where(valid_mask, inverse_probability, 0.0)
+    correction = weights * (ls_strength / vocab_size)
+    if "behave_imp_weight" in stat:
+        correction = correction * stat["behave_imp_weight"].detach()
+
+    # Mask before multiplication so zero-weight/padding logprobs cannot add NaNs.
+    barrier_logprobs = torch.where(correction > 0, logprobs.float(), 0.0)
+    barrier_loss = -correction * barrier_logprobs
+    denominator = loss_mask.count_nonzero().clamp(min=1)
+    loss = loss + barrier_loss.sum() / denominator
+    stat["loss"] = stat["loss"] + barrier_loss.detach()
+    stat.update(
+        ls_refined_weight=weights,
+        ls_refined_correction=correction,
+        ls_refined_barrier_loss=barrier_loss.detach(),
+        ls_refined_clip_saturated=(inverse_logprobs > log_cap) & valid_mask,
+    )
+    return loss, stat
+
+
 def sapo_loss_fn(
     logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
