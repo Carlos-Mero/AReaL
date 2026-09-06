@@ -77,8 +77,8 @@ python3 examples/math/gsm8k_rl.py \
 
 | 参数             | 类型        | 选项                         | 描述                               |
 | ---------------- | ----------- | ---------------------------- | ---------------------------------- |
-| `mean_level`     | str \| None | `"batch"`、`"group"`、`None` | 计算均值的级别                     |
-| `std_level`      | str \| None | `"batch"`、`"group"`、`None` | 计算标准差的级别                   |
+| `mean_level`     | str \| None | `"batch"`、`"group"`、`"maxrl"`、`"maxls"`、`"logit-shift"`、`"logit-shift-legacy"`、`None` | 均值中心化或特殊优势塑形模式       |
+| `std_level`      | str \| None | `"batch"`、`"group"`、`"logit-shift"`、`None` | 标准差放缩或特殊塑形模式       |
 | `mean_leave1out` | bool        | `true`、`false`              | 使用留一法平均值（排除当前样本）   |
 | `std_unbiased`   | bool        | `true`、`false`              | 使用无偏标准差计算（默认：`true`） |
 | `eps`            | float       | -                            | 避免除零的小常数（默认：`1e-5`）   |
@@ -86,6 +86,74 @@ python3 examples/math/gsm8k_rl.py \
 
 "Batch"级在整个全局批次上计算均值/标准差，而"group"级在组内计算（例如，共享相同提示的轨迹）。对于分组级归一化，必须指定 `group_size`。将
 `mean_level` 或 `std_level` 设为 `None` 分别跳过均值减法或标准差缩放。
+
+设置 `actor.adv_norm.mean_level: logit-shift` 后，框架会在 GAE 完成后，使用更新前策略的
+token 概率分别放缩每个有效 token 的优势，然后在保护每条序列最后一个有效 token 的前提下
+执行中心化。权重为 `min(1 / p_token, actor.ls_clip) / actor.ls_clip`。框架会在当前 actor
+batch 的所有非末尾有效 token 上计算一个均值，并且只从这些位置减去该均值；每条序列的
+末尾有效 token 既不参与均值计算，也保留其放缩后的 advantage。若要复现旧实现，请将
+`mean_level` 设置为 `logit-shift-legacy`；该模式会将全部有效 token 纳入全局均值，并从全部
+有效 token 中减去该均值。
+
+两种模式都要求执行真实的更新前 actor 前向计算，例如设置
+`actor.recompute_logprob: true`，并且目前仅支持 `importance_sampling_level: token`。若同时
+配置了 `std_level`，尺度归一化会在 logit-shift 塑形之后执行。末尾 token 的保护只针对
+均值减法；配置的标准差放缩仍会作用于全部有效 token。
+
+```yaml
+actor:
+  recompute_logprob: true
+  ls_clip: 10.0
+  adv_norm:
+    mean_level: logit-shift
+    std_level: null
+```
+
+继续训练或复现使用旧中心化实现的实验时，需要显式迁移配置：
+
+```yaml
+actor:
+  recompute_logprob: true
+  ls_clip: 10.0
+  adv_norm:
+    mean_level: logit-shift-legacy
+    std_level: null
+```
+
+设置 `actor.adv_norm.mean_level: maxls` 会按照如下顺序组合 MaxRL 和保护末尾 token 的
+logit-shift：
+
+1. 对每条序列的 token reward 求和，在同一 prompt group 内中心化序列 return，并除以正的
+   centered return 数量，得到 MaxRL 序列 advantage；
+2. 将每条序列的 MaxRL advantage 广播到其有效 token；
+3. 将每个 token 乘以 `min(1 / p_token, actor.ls_clip) / actor.ls_clip`。
+4. 对每条序列分别在其非末尾有效 token 上计算均值，只从该序列的这些位置减去该均值，并
+   保持它的末尾有效 token 不变。
+
+对于 MaxRL 序列 advantage `M_i`，记
+`S_i,t = M_i * min(1 / p_i,t, ls_clip) / ls_clip`，并记 `mu_i` 为序列 `i` 的全部非末尾
+有效位置上 `S_i,t` 的均值。MaxLS 在这些位置产生 `S_i,t - mu_i`，并在该序列的末尾有效
+位置保留 `S_i,t`。这既不同于普通 logit-shift 使用的 actor batch 均值，也不同于会将末尾
+位置纳入均值并修改这些位置的 legacy 中心化。当 `ls_clip: 1` 时，所有非末尾位置都会变为
+零，只有末尾位置保留 MaxRL advantage。MaxLS 要求 `std_level: null`、token 级 importance
+sampling、真实的更新前 actor 前向计算，以及正的 `group_size`：
+
+```yaml
+actor:
+  recompute_logprob: true
+  ls_clip: 10.0
+  adv_norm:
+    mean_level: maxls
+    std_level: null
+    group_size: ${gconfig.n_samples}
+```
+
+每条序列的非末尾 MaxLS advantage 会独立地保持和为零，其相对正负 credit 由该序列各
+token 的逆概率权重决定，而末尾 token 保留绝对的放缩后 MaxRL credit。因此，一条序列的
+token 概率不会改变另一条序列的中心化基线。
+
+受保护的位置由 `loss_mask` 定义为每条序列的最后一个有效训练 token。对于正常结束的回复，
+它通常是 EOS；如果生成在 EOS 之前被截断，则它会是普通的尾部 token。
 
 如果整个字段被省略（例如YAML中的 `adv_norm: null`），则不执行归一化。
 

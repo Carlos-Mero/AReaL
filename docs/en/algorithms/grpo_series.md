@@ -83,8 +83,8 @@ The `NormConfig` dataclass controls how rewards and advantages are normalized:
 
 | Parameter        | Type        | Options                      | Description                                                |
 | ---------------- | ----------- | ---------------------------- | ---------------------------------------------------------- |
-| `mean_level`     | str \| None | `"batch"`, `"group"`, `None` | Level at which to compute mean for centering               |
-| `std_level`      | str \| None | `"batch"`, `"group"`, `None` | Level at which to compute std for scaling                  |
+| `mean_level`     | str \| None | `"batch"`, `"group"`, `"maxrl"`, `"maxls"`, `"logit-shift"`, `"logit-shift-legacy"`, `None` | Mean centering or specialized advantage shaping mode       |
+| `std_level`      | str \| None | `"batch"`, `"group"`, `"logit-shift"`, `None` | Standard deviation scaling or specialized shaping mode |
 | `mean_leave1out` | bool        | `true`, `false`              | Use leave-one-out average (exclude current sample)         |
 | `std_unbiased`   | bool        | `true`, `false`              | Use unbiased std computation (default: `true`)             |
 | `eps`            | float       | -                            | Small constant to avoid division by zero (default: `1e-5`) |
@@ -95,6 +95,85 @@ computes them within groups (e.g., trajectories sharing the same prompt). For
 group-level normalization, `group_size` must be specified. Setting `mean_level` or
 `std_level` to `None` skips mean subtraction or standard deviation scaling,
 respectively.
+
+Setting `actor.adv_norm.mean_level: logit-shift` applies capped inverse
+pre-update-policy probability scaling independently to every valid token after GAE,
+then centers the scaled advantages while protecting each sequence's final valid
+token. The weight is `min(1 / p_token, actor.ls_clip) / actor.ls_clip`. One mean is
+computed over all non-final valid tokens in the actor batch and subtracted only from
+those tokens. Each final valid token is excluded from the mean and keeps its scaled
+advantage unchanged. Set `mean_level` to `logit-shift-legacy` to reproduce the
+previous behavior, which includes every valid token in the global mean and subtracts
+it from every valid token.
+
+Both modes require a real pre-update actor forward, such as
+`actor.recompute_logprob: true`, and only support
+`importance_sampling_level: token`. Any configured `std_level` scaling is applied
+after logit-shift shaping. Protecting the final token applies only to mean
+subtraction; a configured standard-deviation scaling still rescales all valid
+tokens.
+
+```yaml
+actor:
+  recompute_logprob: true
+  ls_clip: 10.0
+  adv_norm:
+    mean_level: logit-shift
+    std_level: null
+```
+
+To resume an experiment that used the previous centered implementation, migrate its
+configuration explicitly:
+
+```yaml
+actor:
+  recompute_logprob: true
+  ls_clip: 10.0
+  adv_norm:
+    mean_level: logit-shift-legacy
+    std_level: null
+```
+
+Setting `actor.adv_norm.mean_level: maxls` composes MaxRL and the
+final-token-preserving logit-shift mode in this order:
+
+1. Sum token rewards for each sequence, center the sequence returns within each
+   prompt group, and divide by the number of positive centered returns, as in MaxRL.
+2. Broadcast each MaxRL sequence advantage to its valid tokens.
+3. Multiply each token by
+   `min(1 / p_token, actor.ls_clip) / actor.ls_clip`.
+4. Within each sequence, subtract the mean of its resulting non-final valid-token
+   advantages from those positions only, leaving its final valid token unchanged.
+
+For a sequence-level MaxRL advantage `M_i`, let
+`S_i,t = M_i * min(1 / p_i,t, ls_clip) / ls_clip`, and let `mu_i` be the mean of
+`S_i,t` over sequence `i`'s non-final valid tokens. MaxLS produces `S_i,t - mu_i`
+on those positions and preserves `S_i,t` on the sequence's final valid position.
+This differs from both regular logit-shift's actor-batch mean and legacy centering,
+which also includes and modifies final positions. When `ls_clip: 1`, every
+non-final position becomes zero and only the final position retains the MaxRL
+advantage. MaxLS requires `std_level: null`, token-level importance sampling, a real
+pre-update actor forward, and a positive `group_size`:
+
+```yaml
+actor:
+  recompute_logprob: true
+  ls_clip: 10.0
+  adv_norm:
+    mean_level: maxls
+    std_level: null
+    group_size: ${gconfig.n_samples}
+```
+
+The non-final MaxLS advantages sum to zero independently within every sequence.
+Their relative positive and negative credit is determined by each token's
+inverse-probability weight, while the final token retains the absolute scaled MaxRL
+credit. Consequently, one sequence's token probabilities cannot shift another
+sequence's centering baseline.
+
+The protected position is the final valid training token according to `loss_mask`.
+It is normally EOS for a completed response, but it is the ordinary tail token when
+generation was truncated before EOS.
 
 If the entire field is omitted (e.g., `adv_norm: null` in YAML), no normalization is
 performed.

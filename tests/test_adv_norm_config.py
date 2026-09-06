@@ -145,12 +145,12 @@ def test_adv_norm_initialization():
 def test_adv_norm_initialization_validation():
     """Test Normalization initialization validation."""
     # Test invalid mean_level
-    with pytest.raises(ValueError, match="mean_level must be 'batch', 'group' or None"):
+    with pytest.raises(ValueError, match="mean_level must be 'batch'.*'logit-shift'"):
         config = NormConfig(mean_level="invalid", std_level="batch", group_size=1)
         Normalization(config)
 
     # Test invalid std_level
-    with pytest.raises(ValueError, match="std_level must be 'batch', 'group', or None"):
+    with pytest.raises(ValueError, match="std_level must be 'batch'.*'logit-shift'"):
         config = NormConfig(mean_level="batch", std_level="invalid", group_size=1)
         Normalization(config)
 
@@ -161,6 +161,13 @@ def test_adv_norm_initialization_validation():
     ):
         config = NormConfig(mean_level="group", std_level="batch", group_size=0)
         Normalization(config)
+
+
+def test_norm_config_accepts_logit_shift_legacy_mean_level():
+    """Test that the legacy logit-shift mode is a public mean-level choice."""
+    config = NormConfig(mean_level="logit-shift-legacy", std_level=None)
+
+    assert config.mean_level == "logit-shift-legacy"
 
 
 def test_adv_norm_batch_normalization():

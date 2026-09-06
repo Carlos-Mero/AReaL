@@ -306,9 +306,9 @@ Configuration for reward/advantage normalization.
 
 | Parameter        | Type           | Default   | Description                                                                                                      |
 | ---------------- | -------------- | --------- | ---------------------------------------------------------------------------------------------------------------- |
-| `mean_level`     | string \| None | `"batch"` | Mean level for normalization. None for no mean normalization. **Choices:** `batch`, `group`, `maxrl`, `None`     |
+| `mean_level`     | string \| None | `"batch"` | Mean level for normalization. `logit-shift` applies capped inverse-probability scaling and centers only non-final valid tokens; `logit-shift-legacy` centers all valid tokens; `maxls` applies MaxRL followed by per-sequence, final-token-preserving logit-shift centering. **Choices:** `batch`, `group`, `maxrl`, `maxls`, `logit-shift`, `logit-shift-legacy`, `None` |
 | `mean_leave1out` | boolean        | `False`   | Whether to use leave-one-out average.                                                                            |
-| `std_level`      | string \| None | `"batch"` | Standard deviation level for normalization. None for no std normalization. **Choices:** `batch`, `group`, `None` |
+| `std_level`      | string \| None | `"batch"` | Standard deviation scaling or specialized logit-shift shaping. **Choices:** `batch`, `group`, `logit-shift`, `None` |
 | `std_unbiased`   | boolean        | `True`    | Whether to use unbiased standard deviation computation. Defaults to True (changed from False in v0.3.4).         |
 | `eps`            | float          | `1e-05`   | The eps when dividing by standard deviation to avoid numerical issues.                                           |
 | `group_size`     | integer        | `1`       | Group size for group-level normalization                                                                         |
