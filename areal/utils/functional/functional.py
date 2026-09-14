@@ -500,7 +500,8 @@ def logit_shift_advantage_shaping(
         "exclude-last-per-sequence",
         "all",
         "none",
-    ] | None = None,
+    ]
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Scale token advantages and optionally center non-final tokens.
 
@@ -526,9 +527,7 @@ def logit_shift_advantage_shaping(
     if center is not None and centering is not None:
         raise ValueError("center and centering cannot be specified together")
     if centering is None:
-        centering = (
-            "exclude-last" if center is None else ("all" if center else "none")
-        )
+        centering = "exclude-last" if center is None else ("all" if center else "none")
     valid_centering_modes = (
         "exclude-last",
         "exclude-last-per-sequence",
@@ -825,6 +824,7 @@ def ls_refined_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Add a sampled log-barrier to the existing REINFORCE/PPO surrogate.
 
@@ -834,6 +834,12 @@ def ls_refined_loss_fn(
     valid token including the final token. Unlike logit-shift advantage shaping,
     it is neither centered nor divided by ``ls_clip``. Advantage normalization
     happens in the actor before this function.
+
+    ``loss_weights`` contains nonnegative, detached sequence weights broadcast
+    to the token shape (or packed alongside tokens). It scales the complete
+    policy-plus-barrier loss, retaining the original valid-token denominator.
+    The actor supplies inverse group success counts; None preserves unit weights
+    for callers that only need the additive barrier.
 
     PPO ratio/dual clipping only affects the original policy loss. The barrier
     is a separate additive term, not part of the clipped advantage. Both terms
@@ -863,12 +869,19 @@ def ls_refined_loss_fn(
             "must have identical shapes"
         )
 
+    if loss_weights is None:
+        loss_weights = torch.ones_like(logprobs, dtype=torch.float32)
+    elif loss_weights.shape != logprobs.shape:
+        raise ValueError("loss_weights must have the same shape as logprobs")
+    loss_weights = loss_weights.detach().float()
     proximal_logprobs = proximal_logprobs.detach()
+    # Nonnegative weights commute with PPO max/min clipping, so weighting the
+    # advantages here scales the final surrogate without changing its clipping.
     loss, stat = ppo_actor_loss_fn(
         logprobs=logprobs,
         proximal_logprobs=proximal_logprobs,
         old_logprobs=old_logprobs.detach(),
-        advantages=advantages.detach(),
+        advantages=advantages.detach() * loss_weights,
         eps_clip=eps_clip,
         eps_clip_higher=eps_clip_higher,
         c_clip=c_clip,
@@ -883,11 +896,11 @@ def ls_refined_loss_fn(
         valid_mask = valid_mask & stat["behave_mask"]
     log_cap = math.log(ls_clip)
     inverse_logprobs = torch.where(valid_mask, -proximal_logprobs.float(), 0.0)
-    inverse_probability = torch.exp(
-        torch.clamp(inverse_logprobs, max=log_cap)
-    ).clamp_(min=0.0, max=ls_clip)
+    inverse_probability = torch.exp(torch.clamp(inverse_logprobs, max=log_cap)).clamp_(
+        min=0.0, max=ls_clip
+    )
     weights = torch.where(valid_mask, inverse_probability, 0.0)
-    correction = weights * (ls_strength / vocab_size)
+    correction = weights * (ls_strength / vocab_size) * loss_weights
     if "behave_imp_weight" in stat:
         correction = correction * stat["behave_imp_weight"].detach()
 
@@ -899,6 +912,7 @@ def ls_refined_loss_fn(
     stat["loss"] = stat["loss"] + barrier_loss.detach()
     stat.update(
         ls_refined_weight=weights,
+        ls_refined_loss_weight=loss_weights,
         ls_refined_correction=correction,
         ls_refined_barrier_loss=barrier_loss.detach(),
         ls_refined_clip_saturated=(inverse_logprobs > log_cap) & valid_mask,

@@ -61,8 +61,7 @@ class PPOActor:
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
         self.use_logit_shift_advantage = config.adv_norm is not None and (
-            config.adv_norm.mean_level
-            in ("logit-shift", "logit-shift-legacy", "maxls")
+            config.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy", "maxls")
         )
         self.use_maxls = (
             config.adv_norm is not None and config.adv_norm.mean_level == "maxls"
@@ -156,6 +155,7 @@ class PPOActor:
         logger.info(f"  loss_type: {config.loss_type}")
         if self.use_ls_refined:
             logger.info("  loss correction: ls-refined additive log-barrier")
+            logger.info("  loss scaling: inverse group success count (zero if none)")
             logger.info("  correction probability: PRE-UPDATE ACTOR FORWARD")
             logger.info("  correction normalization: full model vocabulary size")
             logger.info(f"  ls_strength: {config.ls_strength}")
@@ -218,6 +218,7 @@ class PPOActor:
         needs_group_metadata = self.adv_norm is not None and (
             self.adv_norm.mean_level == "maxrl"
             or self.use_maxls
+            or self.use_ls_refined
             or self.use_logit_shift_group_accuracy
         )
         if needs_group_metadata:
@@ -237,6 +238,14 @@ class PPOActor:
             bs, device=data["input_ids"].device, dtype=torch.long
         )
         sequence_correct = data["rewards"].detach() > 0
+        if self.use_ls_refined:
+            sequence_weights = self._ls_refined_loss_weights(
+                sequence_correct, adv_group_sizes
+            )
+            # Keep token alignment through minibatch splitting and sequence packing.
+            data["ls_refined_loss_weight"] = sequence_weights[:, None].expand_as(
+                data["loss_mask"]
+            )
 
         # Reward Penalty on length
         if self.config.overlong_reward_penalty:
@@ -358,9 +367,7 @@ class PPOActor:
                 policy_logprobs=policy_logp,
                 loss_mask=loss_mask,
                 ls_clip=self.config.ls_clip,
-                centering=(
-                    "all" if self.use_logit_shift_legacy else "exclude-last"
-                ),
+                centering=("all" if self.use_logit_shift_legacy else "exclude-last"),
             )
             data["logit_shift_advantage_weight"] = logit_shift_advantage_weight
             data["logit_shift_advantage_clipped_mask"] = (
@@ -386,9 +393,7 @@ class PPOActor:
                     ls_clip=self.config.ls_clip,
                     centering="exclude-last-per-sequence",
                 )
-                data["logit_shift_advantage_weight"] = (
-                    logit_shift_advantage_weight
-                )
+                data["logit_shift_advantage_weight"] = logit_shift_advantage_weight
                 data["logit_shift_advantage_clipped_mask"] = (
                     logit_shift_advantage_clipped_mask
                 )
@@ -408,6 +413,41 @@ class PPOActor:
         data["logprobs"] = old_logp
 
         return data
+
+    def _ls_refined_loss_weights(
+        self, sequence_correct: torch.Tensor, group_sizes: list[int] | None
+    ) -> torch.Tensor:
+        """Return detached inverse-success-count weights for complete prompt groups.
+
+        For mixed binary-reward groups, this is the scaling used by MaxRL:
+        ``1 / (group_size * accuracy)``. All-failure groups receive zero weight;
+        all-success groups retain the diversity barrier scaled by ``1 / group_size``.
+        Correctness is measured before reward normalization and length penalties.
+        """
+        if sequence_correct.ndim != 1:
+            raise ValueError("sequence correctness must have shape [batch_size]")
+        bs = sequence_correct.size(0)
+        if group_sizes is None:
+            assert self.adv_norm is not None
+            group_size = self.adv_norm.group_size
+            if group_size < 1:
+                raise ValueError("ls-refined group_size must be positive")
+            group_sizes = [group_size] * (bs // group_size)
+            if bs % group_size:
+                group_sizes.append(bs % group_size)
+        if any(size <= 0 for size in group_sizes) or sum(group_sizes) != bs:
+            raise ValueError(
+                f"group sizes must be positive and sum to batch size {bs}, "
+                f"got {group_sizes}"
+            )
+        weights = torch.zeros_like(sequence_correct, dtype=torch.float32)
+        start = 0
+        for size in group_sizes:
+            group_slice = slice(start, start + size)
+            successes = sequence_correct[group_slice].detach().float().sum()
+            weights[group_slice] = (successes > 0) / successes.clamp(min=1)
+            start += size
+        return weights
 
     def _get_ls_vocab_size(self) -> int:
         """Read the global output vocabulary after the training engine initializes."""
@@ -732,6 +772,7 @@ def grpo_loss_fn(
             vocab_size=ls_vocab_size,
             ls_strength=ls_strength,
             ls_clip=ls_clip,
+            loss_weights=input_data.get("ls_refined_loss_weight"),
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
@@ -915,6 +956,7 @@ def grpo_loss_fn(
     if "ls_refined_weight" in stat:
         stats_tracker.stat(
             ls_refined_weight=stat["ls_refined_weight"],
+            ls_refined_loss_weight=stat["ls_refined_loss_weight"],
             ls_refined_correction=stat["ls_refined_correction"],
             ls_refined_barrier_loss=stat["ls_refined_barrier_loss"],
             ls_refined_clip_saturated=stat["ls_refined_clip_saturated"].float(),
