@@ -176,7 +176,9 @@ class PPOTrainer:
             )
             self.critic = self._create_critic(config.critic, critic_alloc)
         self.ref = None
-        if config.actor.kl_ctl > 0 and config.ref is not None:
+        if (
+            config.actor.kl_ctl > 0 or config.actor.ckl_ctl > 0
+        ) and config.ref is not None:
             ref_alloc = ModelAllocation.from_str(config.ref.backend, name="ref")
             self.ref = self._create_train_engine(config.ref, ref_alloc)
 

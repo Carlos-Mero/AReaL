@@ -1736,6 +1736,57 @@ class KLEstimator:
         return log_ratio
 
 
+@torch.no_grad()
+def conditional_kl_signal(
+    log_probs: torch.Tensor,
+    ref_log_probs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    rewards: torch.Tensor,
+    group_sizes: list[int],
+) -> torch.Tensor:
+    """Center sequence k1 within each (prompt, raw binary reward) class.
+
+    Rows in each consecutive prompt group must be complete responses. Sum over
+    generated tokens, then average *sequences* equally, regardless of length.
+    Empty responses do not contribute to class means; singleton classes return
+    zero. The result is a detached policy-gradient signal, not a KL value.
+    Unlike ordinary KL reward shaping, clipping before centering would destroy
+    invariance to class-constant log-ratio shifts, so k1 is left unclamped.
+    """
+    if log_probs.ndim != 2 or not (
+        log_probs.shape == ref_log_probs.shape == loss_mask.shape
+    ):
+        raise ValueError("conditional KL expects matching [batch, sequence] tensors")
+    bs = log_probs.shape[0]
+    if rewards.shape != torch.Size([bs]):
+        raise ValueError("conditional KL expects one raw binary reward per response")
+    if any(size <= 0 for size in group_sizes) or sum(group_sizes) != bs:
+        raise ValueError("conditional KL prompt group sizes must sum to batch size")
+    mask = loss_mask.bool()
+    valid = mask.any(dim=-1)
+    binary = torch.all(~valid | (rewards == 0) | (rewards == 1))
+    error = "conditional KL requires raw rewards in {0, 1}"
+    if rewards.is_cuda:
+        # Fail on invalid training data without synchronizing every GPU batch.
+        torch._assert_async(binary, error)
+    elif not binary:
+        raise ValueError(error)
+    log_ratio = KLEstimator("k1", apply_clamp=False)(log_probs, ref_log_probs)
+    sequence_k1 = torch.where(mask, log_ratio, 0.0).sum(dim=-1)
+    group_ids = torch.repeat_interleave(
+        torch.arange(len(group_sizes), device=log_probs.device),
+        torch.tensor(group_sizes, device=log_probs.device),
+        output_size=bs,
+    )
+    class_ids = 2 * group_ids + (rewards == 1).long()
+    counts = sequence_k1.new_zeros(2 * len(group_sizes))
+    totals = torch.zeros_like(counts)
+    counts.scatter_add_(0, class_ids, valid.to(counts.dtype))
+    totals.scatter_add_(0, class_ids, sequence_k1)
+    means = totals / counts.clamp(min=1)
+    return torch.where(valid, sequence_k1 - means[class_ids], 0.0)
+
+
 def make_dummy_eval_item(template: dict[str, Any]) -> dict[str, Any]:
     """Create a zero-contribution dummy item matching *template*'s schema.
 

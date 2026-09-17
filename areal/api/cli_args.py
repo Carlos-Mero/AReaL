@@ -99,9 +99,7 @@ class NormConfig:
     )
     group_size: int = field(
         default=1,
-        metadata={
-            "help": "Group size for group-level normalization and MaxRL/MaxLS"
-        },
+        metadata={"help": "Group size for group-level normalization and MaxRL/MaxLS"},
     )
 
     def __post_init__(self):
@@ -118,8 +116,7 @@ class NormConfig:
                 f"got {self.std_level}"
             )
         if (
-            self.mean_level in ("group", "maxrl", "maxls")
-            or self.std_level == "group"
+            self.mean_level in ("group", "maxrl", "maxls") or self.std_level == "group"
         ) and self.group_size < 1:
             raise ValueError(
                 f"group_size must be a positive integer when using group normalization, got {self.group_size}"
@@ -1603,6 +1600,16 @@ class PPOActorConfig(TrainEngineConfig):
 
     # KL Control
     kl_ctl: float = field(default=0.1, metadata={"help": "KL divergence coefficient"})
+    ckl_ctl: float = field(
+        default=0.0,
+        metadata={
+            "help": "Conditional KL reward coefficient (finite, nonnegative). "
+            "Centers sequence k1 log-ratios within each prompt and raw binary "
+            "reward class. Requires ref, kl_estimator='k1', discount=gae_lambda=1, "
+            "token-level PPO/GRPO and standard advantage normalization. Set kl_ctl=0 to "
+            "apply only conditional KL. Zero disables conditional KL."
+        },
+    )
     kl_estimator: str = field(
         default="k1",
         metadata={"help": "KL divergence estimator", "choices": ["k1", "k2", "k3"]},
@@ -1705,6 +1712,32 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if not math.isfinite(self.ckl_ctl) or self.ckl_ctl < 0:
+            raise ValueError("ckl_ctl must be finite and nonnegative")
+        if self.ckl_ctl > 0:
+            if self.kl_estimator != "k1":
+                raise ValueError("ckl_ctl requires kl_estimator='k1'")
+            if self.discount != 1.0 or self.gae_lambda != 1.0:
+                raise ValueError("ckl_ctl requires discount=gae_lambda=1")
+            if self.importance_sampling_level != "token":
+                raise ValueError("ckl_ctl requires importance_sampling_level='token'")
+            if (
+                self.loss_type != "reinforce"
+                or self.use_sapo_loss
+                or self.use_cispo_loss
+                or (
+                    self.adv_norm is not None
+                    and self.adv_norm.mean_level not in (None, "batch", "group")
+                )
+                or any(
+                    norm is not None and norm.std_level == "logit-shift"
+                    for norm in (self.reward_norm, self.adv_norm)
+                )
+            ):
+                raise ValueError(
+                    "ckl_ctl requires standard PPO/GRPO loss and normalization; "
+                    "custom loss or logit-shift/MaxRL advantage shaping is unsupported"
+                )
         if self.loss_type not in ("reinforce", "prob_sq"):
             raise ValueError(
                 "loss_type must be 'reinforce' or 'prob_sq'; configure logit-shift "
@@ -1723,8 +1756,7 @@ class PPOActorConfig(TrainEngineConfig):
             )
         if not math.isfinite(self.ls_strength) or self.ls_strength < 0:
             raise ValueError(
-                "ls_strength must be finite and nonnegative, "
-                f"got {self.ls_strength!r}"
+                f"ls_strength must be finite and nonnegative, got {self.ls_strength!r}"
             )
         use_ls_refined = (
             self.adv_norm is not None and self.adv_norm.mean_level == "ls-refined"
@@ -1739,8 +1771,7 @@ class PPOActorConfig(TrainEngineConfig):
             self.reward_norm is not None and self.reward_norm.std_level == "logit-shift"
         )
         use_logit_shift_advantage = self.adv_norm is not None and (
-            self.adv_norm.mean_level
-            in ("logit-shift", "logit-shift-legacy", "maxls")
+            self.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy", "maxls")
         )
         if self.reward_norm is not None and self.reward_norm.mean_level in (
             "logit-shift",
@@ -3206,6 +3237,8 @@ class PPOConfig(BaseExperimentConfig):
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if self.actor.ckl_ctl > 0 and self.ref is None:
+            raise ValueError("actor.ckl_ctl > 0 requires a reference model (ref)")
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
         # Propagate the LoRA adapter name to the rollout engine so the OpenAI-proxy

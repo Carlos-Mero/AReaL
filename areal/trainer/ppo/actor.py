@@ -30,6 +30,7 @@ from areal.utils.data import (
     Normalization,
     batched_call,
     concat_batch,
+    conditional_kl_signal,
     split_batch,
     split_padded_tensor_dict_into_mb_list,
 )
@@ -58,6 +59,7 @@ class PPOActor:
         self.reward_clip = config.reward_clip
 
         self.kl_ctl = config.kl_ctl
+        self.ckl_ctl = config.ckl_ctl
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
         self.use_logit_shift_advantage = config.adv_norm is not None and (
@@ -153,6 +155,7 @@ class PPOActor:
         logger.info("=" * 70)
         logger.info("Training Parameters:")
         logger.info(f"  loss_type: {config.loss_type}")
+        logger.info(f"  kl_ctl: {config.kl_ctl}; ckl_ctl: {config.ckl_ctl}")
         if self.use_ls_refined:
             logger.info("  loss correction: ls-refined additive log-barrier")
             logger.info("  loss scaling: inverse group success count (zero if none)")
@@ -215,11 +218,15 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        needs_group_metadata = self.adv_norm is not None and (
-            self.adv_norm.mean_level == "maxrl"
-            or self.use_maxls
-            or self.use_ls_refined
-            or self.use_logit_shift_group_accuracy
+        needs_group_metadata = (
+            self.ckl_ctl > 0
+            or self.adv_norm is not None
+            and (
+                self.adv_norm.mean_level == "maxrl"
+                or self.use_maxls
+                or self.use_ls_refined
+                or self.use_logit_shift_group_accuracy
+            )
         )
         if needs_group_metadata:
             batched, meta = concat_batch(data)
@@ -238,6 +245,8 @@ class PPOActor:
             bs, device=data["input_ids"].device, dtype=torch.long
         )
         sequence_correct = data["rewards"].detach() > 0
+        # Preserve raw outcome labels before reward scaling/length penalties.
+        ckl_outcomes = data["rewards"].detach().clone() if self.ckl_ctl > 0 else None
         if self.use_ls_refined:
             sequence_weights = self._ls_refined_loss_weights(
                 sequence_correct, adv_group_sizes
@@ -302,6 +311,8 @@ class PPOActor:
                 data["prox_logp"] = old_logp
         ref_logp = data.get("ref_logp")
         if ref_logp is None:
+            if self.ckl_ctl > 0:
+                raise ValueError("ckl_ctl > 0 requires ref_logp from a reference model")
             ref_logp = torch.zeros_like(old_logp)
         ref_logp *= loss_mask
         old_logp *= loss_mask
@@ -321,6 +332,25 @@ class PPOActor:
             )
         else:
             rewards[batch_indices, indices] += reward_score
+
+        if self.ckl_ctl > 0:
+            if adv_group_sizes is None:
+                raise ValueError("conditional KL requires prompt group metadata")
+            assert ckl_outcomes is not None
+            ckl_signal = conditional_kl_signal(
+                old_logp, ref_logp, loss_mask, ckl_outcomes, adv_group_sizes
+            )
+            # Terminal placement gives every response token the full centered
+            # sequence signal under gamma=lambda=1. Tokenwise centering followed
+            # by reward-to-go is not equivalent: the outcome depends on the future.
+            positions = torch.arange(max_seqlen, device=loss_mask.device)
+            last_response = torch.where(loss_mask.bool(), positions, -1).amax(-1)
+            ckl_rewards = torch.zeros_like(rewards)
+            ckl_rewards[batch_indices, last_response.clamp(min=0)] = (
+                -self.ckl_ctl * ckl_signal
+            )
+            rewards += ckl_rewards
+            data["ckl_rewards"] = ckl_rewards
 
         if self.use_logit_shift_reward:
             assert policy_logp is not None
@@ -551,6 +581,8 @@ class PPOActor:
             kl_rewards=data["kl_rewards"],
             final_reward=data["tot_rewards"],
         )
+        if "ckl_rewards" in data:
+            stats["ckl_rewards"] = data["ckl_rewards"]
         if "logit_shift_reward_weight" in data:
             stats["logit_shift_reward_weight"] = data[
                 "logit_shift_reward_weight"
@@ -615,6 +647,7 @@ class PPOActor:
             "rewards",
             "tot_rewards",
             "kl_rewards",
+            "ckl_rewards",
             "logit_shift_reward_weight",
             "ls_clipped_mask",
             "logit_shift_advantage_weight",
