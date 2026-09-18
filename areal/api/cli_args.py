@@ -1604,8 +1604,10 @@ class PPOActorConfig(TrainEngineConfig):
         default=0.0,
         metadata={
             "help": "Conditional KL reward coefficient (finite, nonnegative). "
-            "Centers sequence k1 log-ratios within each prompt and raw binary "
-            "reward class. Requires ref, kl_estimator='k1', discount=gae_lambda=1, "
+            "Centers sequence k1 log-ratios only among responses with raw reward > 0 "
+            "within each prompt. At least two valid positive responses are required; "
+            "nonpositive responses receive no conditional KL penalty. "
+            "Requires ref, kl_estimator='k1', discount=gae_lambda=1, "
             "token-level PPO/GRPO and standard advantage normalization. Set kl_ctl=0 to "
             "apply only conditional KL. Zero disables conditional KL."
         },
