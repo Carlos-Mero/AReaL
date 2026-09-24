@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -36,9 +35,6 @@ from areal.utils.data import (
 )
 from areal.utils.functional import (
     cispo_loss_fn,
-    logit_shift_advantage_shaping,
-    logit_shift_reward_shaping,
-    ls_refined_loss_fn,
     ppo_actor_loss_fn,
     prob_sq_loss_fn,
     reward_overlong_penalty,
@@ -62,39 +58,9 @@ class PPOActor:
         self.ckl_ctl = config.ckl_ctl
         self.kl_estimator = KLEstimator(config.kl_estimator)
 
-        self.use_logit_shift_advantage = config.adv_norm is not None and (
-            config.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy", "maxls")
-        )
-        self.use_maxls = (
-            config.adv_norm is not None and config.adv_norm.mean_level == "maxls"
-        )
-        self.use_logit_shift_legacy = (
-            config.adv_norm is not None
-            and config.adv_norm.mean_level == "logit-shift-legacy"
-        )
-        self.use_ls_refined = (
-            config.adv_norm is not None and config.adv_norm.mean_level == "ls-refined"
-        )
-        self.use_logit_shift_group_accuracy = (
-            config.adv_norm is not None and config.adv_norm.std_level == "logit-shift"
-        )
-        adv_norm_config = config.adv_norm
-        if self.use_maxls:
-            adv_norm_config = replace(adv_norm_config, mean_level="maxrl")
-        elif self.use_logit_shift_advantage or self.use_ls_refined:
-            adv_norm_config = replace(adv_norm_config, mean_level=None)
-        if self.use_logit_shift_group_accuracy:
-            adv_norm_config = replace(adv_norm_config, std_level=None)
-        self.adv_norm = Normalization(adv_norm_config) if adv_norm_config else None
-        self.use_logit_shift_reward = (
-            config.reward_norm is not None
-            and config.reward_norm.std_level == "logit-shift"
-        )
-        reward_norm_config = config.reward_norm
-        if self.use_logit_shift_reward:
-            reward_norm_config = replace(config.reward_norm, std_level=None)
+        self.adv_norm = Normalization(config.adv_norm) if config.adv_norm else None
         self.reward_norm = (
-            Normalization(reward_norm_config) if reward_norm_config else None
+            Normalization(config.reward_norm) if config.reward_norm else None
         )
 
         self.discount = config.discount
@@ -156,42 +122,6 @@ class PPOActor:
         logger.info("Training Parameters:")
         logger.info(f"  loss_type: {config.loss_type}")
         logger.info(f"  kl_ctl: {config.kl_ctl}; ckl_ctl: {config.ckl_ctl}")
-        if self.use_ls_refined:
-            logger.info("  loss correction: ls-refined additive log-barrier")
-            logger.info("  loss scaling: inverse group success count (zero if none)")
-            logger.info("  correction probability: PRE-UPDATE ACTOR FORWARD")
-            logger.info("  correction normalization: full model vocabulary size")
-            logger.info(f"  ls_strength: {config.ls_strength}")
-            logger.info(f"  ls_clip: {config.ls_clip}")
-        if self.use_logit_shift_reward:
-            logger.info("  reward shaping: logit-shift")
-            logger.info("  reward probability: PRE-UPDATE ACTOR FORWARD")
-            logger.info(f"  ls_clip: {config.ls_clip}")
-        if self.use_logit_shift_advantage:
-            if self.use_maxls:
-                logger.info(
-                    "  advantage shaping: MaxRL group advantage followed by "
-                    "per-token inverse-probability logit-shift"
-                )
-            else:
-                logger.info(
-                    "  advantage shaping: per-token inverse-probability logit-shift"
-                )
-            logger.info(
-                "  advantage centering: "
-                + (
-                    "legacy batch-wide mean over all valid tokens"
-                    if self.use_logit_shift_legacy
-                    else (
-                        "per-sequence mean over non-final valid tokens"
-                        if self.use_maxls
-                        else "batch-wide mean over non-final valid tokens"
-                    )
-                )
-            )
-            logger.info(f"  ls_clip: {config.ls_clip}")
-        if self.use_logit_shift_group_accuracy:
-            logger.info("  advantage std shaping: logit-shift (1 - group accuracy)")
         logger.info(
             f"  importance_sampling_level: {getattr(config, 'importance_sampling_level', 'token')}"
         )
@@ -218,15 +148,8 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        needs_group_metadata = (
-            self.ckl_ctl > 0
-            or self.adv_norm is not None
-            and (
-                self.adv_norm.mean_level == "maxrl"
-                or self.use_maxls
-                or self.use_ls_refined
-                or self.use_logit_shift_group_accuracy
-            )
+        needs_group_metadata = self.ckl_ctl > 0 or (
+            self.adv_norm is not None and self.adv_norm.mean_level == "maxrl"
         )
         if needs_group_metadata:
             batched, meta = concat_batch(data)
@@ -255,18 +178,8 @@ class PPOActor:
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
         )
-        sequence_correct = data["rewards"].detach() > 0
         # Preserve raw outcome labels before reward scaling/length penalties.
         ckl_outcomes = data["rewards"].detach().clone() if self.ckl_ctl > 0 else None
-        if self.use_ls_refined:
-            sequence_weights = self._ls_refined_loss_weights(
-                sequence_correct, adv_group_sizes
-            )
-            # Keep token alignment through minibatch splitting and sequence packing.
-            data["ls_refined_loss_weight"] = sequence_weights[:, None].expand_as(
-                data["loss_mask"]
-            )
-
         # Reward Penalty on length
         if self.config.overlong_reward_penalty:
             overlong_tokens = self.config.overlong_tokens
@@ -293,18 +206,6 @@ class PPOActor:
         loss_mask = data["loss_mask"].float()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
         behavior_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
-        needs_policy_logp = (
-            self.use_logit_shift_reward
-            or self.use_logit_shift_advantage
-            or self.use_ls_refined
-        )
-        policy_logp = data.get("prox_logp") if needs_policy_logp else None
-        if needs_policy_logp and policy_logp is None:
-            raise ValueError(
-                "prox_logp is required for logit-shift shaping or ls-refined. "
-                "Enable a "
-                "real policy log-probability recompute before computing advantages."
-            )
         # Apply the mask to log probabilities.
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
@@ -363,17 +264,6 @@ class PPOActor:
             rewards += ckl_rewards
             data["ckl_rewards"] = ckl_rewards
 
-        if self.use_logit_shift_reward:
-            assert policy_logp is not None
-            rewards, logit_shift_weight, ls_clipped_mask = logit_shift_reward_shaping(
-                rewards=rewards,
-                policy_logprobs=policy_logp,
-                loss_mask=loss_mask,
-                ls_clip=self.config.ls_clip,
-            )
-            data["logit_shift_reward_weight"] = logit_shift_weight
-            data["ls_clipped_mask"] = ls_clipped_mask
-
         # Compute GAE.
         if "values" not in data:
             values = torch.zeros_like(rewards)
@@ -397,53 +287,12 @@ class PPOActor:
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         data["returns"] = advantages + values
 
-        if self.use_logit_shift_advantage and not self.use_maxls:
-            assert policy_logp is not None
-            (
-                advantages,
-                logit_shift_advantage_weight,
-                logit_shift_advantage_clipped_mask,
-            ) = logit_shift_advantage_shaping(
-                advantages=advantages,
-                policy_logprobs=policy_logp,
-                loss_mask=loss_mask,
-                ls_clip=self.config.ls_clip,
-                centering=("all" if self.use_logit_shift_legacy else "exclude-last"),
-            )
-            data["logit_shift_advantage_weight"] = logit_shift_advantage_weight
-            data["logit_shift_advantage_clipped_mask"] = (
-                logit_shift_advantage_clipped_mask
-            )
-
         # Optionally perform advantage normalization.
         if self.adv_norm is not None:
             norm_input = rewards if self.adv_norm.mean_level == "maxrl" else advantages
             advantages = self.adv_norm(
                 norm_input, loss_mask, group_sizes=adv_group_sizes
             )
-            if self.use_maxls:
-                assert policy_logp is not None
-                (
-                    advantages,
-                    logit_shift_advantage_weight,
-                    logit_shift_advantage_clipped_mask,
-                ) = logit_shift_advantage_shaping(
-                    advantages=advantages,
-                    policy_logprobs=policy_logp,
-                    loss_mask=loss_mask,
-                    ls_clip=self.config.ls_clip,
-                    centering="exclude-last-per-sequence",
-                )
-                data["logit_shift_advantage_weight"] = logit_shift_advantage_weight
-                data["logit_shift_advantage_clipped_mask"] = (
-                    logit_shift_advantage_clipped_mask
-                )
-            if self.use_logit_shift_group_accuracy:
-                advantages = self._scale_advantages_by_group_accuracy(
-                    advantages,
-                    sequence_correct,
-                    group_sizes=adv_group_sizes,
-                )
 
         # Store data in the dict.
         data["advantages"] = advantages
@@ -455,96 +304,6 @@ class PPOActor:
 
         return data
 
-    def _ls_refined_loss_weights(
-        self, sequence_correct: torch.Tensor, group_sizes: list[int] | None
-    ) -> torch.Tensor:
-        """Return detached inverse-success-count weights for complete prompt groups.
-
-        For mixed binary-reward groups, this is the scaling used by MaxRL:
-        ``1 / (group_size * accuracy)``. All-failure groups receive zero weight;
-        all-success groups retain the diversity barrier scaled by ``1 / group_size``.
-        Correctness is measured before reward normalization and length penalties.
-        """
-        if sequence_correct.ndim != 1:
-            raise ValueError("sequence correctness must have shape [batch_size]")
-        bs = sequence_correct.size(0)
-        if group_sizes is None:
-            assert self.adv_norm is not None
-            group_size = self.adv_norm.group_size
-            if group_size < 1:
-                raise ValueError("ls-refined group_size must be positive")
-            group_sizes = [group_size] * (bs // group_size)
-            if bs % group_size:
-                group_sizes.append(bs % group_size)
-        if any(size <= 0 for size in group_sizes) or sum(group_sizes) != bs:
-            raise ValueError(
-                f"group sizes must be positive and sum to batch size {bs}, "
-                f"got {group_sizes}"
-            )
-        weights = torch.zeros_like(sequence_correct, dtype=torch.float32)
-        start = 0
-        for size in group_sizes:
-            group_slice = slice(start, start + size)
-            successes = sequence_correct[group_slice].detach().float().sum()
-            weights[group_slice] = (successes > 0) / successes.clamp(min=1)
-            start += size
-        return weights
-
-    def _get_ls_vocab_size(self) -> int:
-        """Read the global output vocabulary after the training engine initializes."""
-        model_config = getattr(self.engine, "model_config", None)
-        if model_config is None:
-            model_config = getattr(self.engine, "hf_config", None)
-        text_config = getattr(model_config, "text_config", model_config)
-        vocab_size = getattr(text_config, "vocab_size", None)
-        if (
-            not isinstance(vocab_size, int)
-            or isinstance(vocab_size, bool)
-            or vocab_size < 1
-        ):
-            raise ValueError(
-                "ls-refined requires the initialized engine's model_config or "
-                "hf_config to provide a positive language-model vocab_size"
-            )
-        return vocab_size
-
-    def _scale_advantages_by_group_accuracy(
-        self,
-        advantages: torch.Tensor,
-        sequence_correct: torch.Tensor,
-        group_sizes: list[int] | None,
-    ) -> torch.Tensor:
-        """Scale each group's centered advantages by one minus its accuracy."""
-        bs = advantages.size(0)
-        if sequence_correct.ndim != 1 or sequence_correct.size(0) != bs:
-            raise ValueError(
-                "sequence correctness must have shape [batch_size], "
-                f"got {sequence_correct.shape} for batch size {bs}"
-            )
-
-        if group_sizes is None:
-            assert self.adv_norm is not None
-            group_size = self.adv_norm.group_size
-            group_sizes = [group_size] * (bs // group_size)
-            remainder = bs % group_size
-            if remainder:
-                group_sizes.append(remainder)
-        if any(group_size <= 0 for group_size in group_sizes):
-            raise ValueError(f"group sizes must be positive, got {group_sizes}")
-        if sum(group_sizes) != bs:
-            raise ValueError(
-                f"group sizes must sum to batch size {bs}, got {sum(group_sizes)}"
-            )
-
-        scaled = torch.empty_like(advantages)
-        start = 0
-        for group_size in group_sizes:
-            group_slice = slice(start, start + group_size)
-            start += group_size
-            group_accuracy = sequence_correct[group_slice].float().mean()
-            scaled[group_slice] = advantages[group_slice] * (1.0 - group_accuracy)
-        return scaled
-
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
@@ -555,7 +314,6 @@ class PPOActor:
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
         seqlens = attn_mask.sum(-1)
-        ls_vocab_size = self._get_ls_vocab_size() if self.use_ls_refined else None
 
         ########## Logging code starts ##########
         result_denominators = {
@@ -594,18 +352,6 @@ class PPOActor:
         )
         if "ckl_rewards" in data:
             stats["ckl_rewards"] = data["ckl_rewards"]
-        if "logit_shift_reward_weight" in data:
-            stats["logit_shift_reward_weight"] = data[
-                "logit_shift_reward_weight"
-            ].float()
-            stats["ls_clip_saturated"] = data["ls_clipped_mask"].float()
-        if "logit_shift_advantage_weight" in data:
-            stats["logit_shift_advantage_weight"] = data[
-                "logit_shift_advantage_weight"
-            ].float()
-            stats["logit_shift_advantage_clip_saturated"] = data[
-                "logit_shift_advantage_clipped_mask"
-            ].float()
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
@@ -620,15 +366,6 @@ class PPOActor:
             mask_no_eos_with_zero=self.config.mask_no_eos_with_zero,
             eps_clip=self.config.eps_clip,
         )
-        if (
-            self.use_logit_shift_reward
-            or self.use_logit_shift_advantage
-            or self.use_ls_refined
-        ):
-            scalars["ls_clip"] = self.config.ls_clip
-        if self.use_ls_refined:
-            scalars["ls_strength"] = self.config.ls_strength
-            scalars["ls_vocab_size"] = ls_vocab_size
         if self.config.c_clip is not None:
             scalars["c_clip"] = self.config.c_clip
             scalars["use_dual_clip"] = 1
@@ -659,10 +396,6 @@ class PPOActor:
             "tot_rewards",
             "kl_rewards",
             "ckl_rewards",
-            "logit_shift_reward_weight",
-            "ls_clipped_mask",
-            "logit_shift_advantage_weight",
-            "logit_shift_advantage_clipped_mask",
         ]:
             data.pop(key, None)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
@@ -695,10 +428,6 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
-                        use_ls_refined=self.use_ls_refined,
-                        ls_strength=self.config.ls_strength,
-                        ls_clip=self.config.ls_clip,
-                        ls_vocab_size=ls_vocab_size,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -765,10 +494,6 @@ def grpo_loss_fn(
     use_decoupled_loss: bool = False,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
-    use_ls_refined: bool = False,
-    ls_strength: float = 1.0,
-    ls_clip: float = 10.0,
-    ls_vocab_size: int | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -795,33 +520,7 @@ def grpo_loss_fn(
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
 
     # Use a direct actor loss, CISPO, SAPO, or PPO loss.
-    if use_ls_refined:
-        if loss_type != "reinforce" or use_cispo_loss or use_sapo_loss:
-            raise ValueError(
-                "ls-refined requires loss_type='reinforce' with SAPO and CISPO disabled"
-            )
-        if prox_logp_gt is None:
-            raise ValueError("ls-refined requires pre-update policy log-probabilities")
-        if ls_vocab_size is None:
-            raise ValueError("ls-refined requires the full model vocabulary size")
-        loss, stat = ls_refined_loss_fn(
-            logprobs=logprobs,
-            proximal_logprobs=prox_logp,
-            old_logprobs=old_logp,
-            advantages=advantages,
-            eps_clip=eps_clip,
-            eps_clip_higher=eps_clip_higher,
-            c_clip=c_clip,
-            loss_mask=loss_mask,
-            vocab_size=ls_vocab_size,
-            ls_strength=ls_strength,
-            ls_clip=ls_clip,
-            loss_weights=input_data.get("ls_refined_loss_weight"),
-            rejection_sampling=rejection_sampling,
-            importance_sampling_level=importance_sampling_level,
-            cu_seqlens=input_data.get("cu_seqlens"),
-        )
-    elif loss_type == "prob_sq":
+    if loss_type == "prob_sq":
         if use_cispo_loss or use_sapo_loss:
             raise ValueError(
                 "prob_sq is mutually exclusive with SAPO and CISPO. "
@@ -893,8 +592,7 @@ def grpo_loss_fn(
     else:
         raise ValueError(
             f"Unsupported actor loss_type: {loss_type!r}. "
-            "Expected 'reinforce' or 'prob_sq'. Configure logit-shift with "
-            "actor.reward_norm.std_level='logit-shift'."
+            "Expected 'reinforce' or 'prob_sq'."
         )
 
     # Joint Distillation KL Loss
@@ -996,16 +694,6 @@ def grpo_loss_fn(
         )
     if "filtered_fraction" in stat:
         stats_tracker.scalar(rs_filtered_fraction=stat["filtered_fraction"])
-
-    if "ls_refined_weight" in stat:
-        stats_tracker.stat(
-            ls_refined_weight=stat["ls_refined_weight"],
-            ls_refined_loss_weight=stat["ls_refined_loss_weight"],
-            ls_refined_correction=stat["ls_refined_correction"],
-            ls_refined_barrier_loss=stat["ls_refined_barrier_loss"],
-            ls_refined_clip_saturated=stat["ls_refined_clip_saturated"].float(),
-            denominator="n_valid_tokens",
-        )
 
     if "prob_sq_weight" in stat:
         stats_tracker.stat(

@@ -39,17 +39,8 @@ logger = logging.getLogger("CLIArgs")
 
 ConfigT = TypeVar("ConfigT")
 
-_NORM_MEAN_LEVELS = (
-    "batch",
-    "group",
-    "maxrl",
-    "maxls",
-    "logit-shift",
-    "logit-shift-legacy",
-    "ls-refined",
-    None,
-)
-_NORM_STD_LEVELS = ("batch", "group", "logit-shift", None)
+_NORM_MEAN_LEVELS = ("batch", "group", "maxrl", None)
+_NORM_STD_LEVELS = ("batch", "group", None)
 
 
 @dataclass
@@ -59,15 +50,8 @@ class NormConfig:
     mean_level: str | None = field(
         default="batch",
         metadata={
-            "help": "Mean level for normalization. 'logit-shift' applies capped "
-            "inverse pre-update-policy probability scaling, then centers non-final "
-            "token advantages while preserving each sequence's final token. "
-            "'logit-shift-legacy' centers all scaled valid-token advantages. "
-            "'maxls' applies MaxRL group advantages followed by the new logit-shift "
-            "scaling and per-sequence non-final-token centering. 'ls-refined' "
-            "adds a capped, vocabulary-normalized log-barrier to the REINFORCE "
-            "loss without centering advantages. None disables mean "
-            "normalization.",
+            "help": "Mean level for normalization. Use batch or group centering, "
+            "MaxRL advantage normalization, or None to disable mean normalization.",
             "choices": list(_NORM_MEAN_LEVELS),
         },
     )
@@ -78,9 +62,7 @@ class NormConfig:
     std_level: str | None = field(
         default="batch",
         metadata={
-            "help": "Standard deviation level for normalization. 'logit-shift' "
-            "enables pre-update-policy reward shaping for actor.reward_norm, or "
-            "group-accuracy advantage scaling for actor.adv_norm. "
+            "help": "Standard deviation level for normalization. "
             "None disables standard deviation scaling.",
             "choices": list(_NORM_STD_LEVELS),
         },
@@ -99,24 +81,22 @@ class NormConfig:
     )
     group_size: int = field(
         default=1,
-        metadata={"help": "Group size for group-level normalization and MaxRL/MaxLS"},
+        metadata={"help": "Group size for group-level normalization and MaxRL"},
     )
 
     def __post_init__(self):
         """Validate normalization configuration."""
         if self.mean_level not in _NORM_MEAN_LEVELS:
             raise ValueError(
-                "mean_level must be 'batch', 'group', 'maxrl', 'maxls', "
-                "'logit-shift', 'logit-shift-legacy', 'ls-refined', or None, "
+                "mean_level must be 'batch', 'group', 'maxrl', or None, "
                 f"got {self.mean_level}"
             )
         if self.std_level not in _NORM_STD_LEVELS:
             raise ValueError(
-                "std_level must be 'batch', 'group', 'logit-shift', or None, "
-                f"got {self.std_level}"
+                f"std_level must be 'batch', 'group', or None, got {self.std_level}"
             )
         if (
-            self.mean_level in ("group", "maxrl", "maxls") or self.std_level == "group"
+            self.mean_level in ("group", "maxrl") or self.std_level == "group"
         ) and self.group_size < 1:
             raise ValueError(
                 f"group_size must be a positive integer when using group normalization, got {self.group_size}"
@@ -1516,24 +1496,6 @@ class PPOActorConfig(TrainEngineConfig):
             "choices": ["reinforce", "prob_sq"],
         },
     )
-    ls_clip: float = field(
-        default=10.0,
-        metadata={
-            "help": "Maximum inverse pre-update-policy probability weight for "
-            "logit-shift shaping or the ls-refined log-barrier. Must be finite "
-            "and at least 1. The ls-refined correction divides this capped "
-            "weight by vocabulary size, not by ls_clip."
-        },
-    )
-    ls_strength: float = field(
-        default=1.0,
-        metadata={
-            "help": "Fixed log-barrier coefficient for "
-            "actor.adv_norm.mean_level='ls-refined'. Applies to all valid tokens "
-            "independently of advantage; must be finite and nonnegative. "
-            "Zero disables the correction."
-        },
-    )
     ppo_n_minibatches: int = field(
         default=4, metadata={"help": "Number of minibatches for each PPO update"}
     )
@@ -1731,100 +1693,20 @@ class PPOActorConfig(TrainEngineConfig):
                     self.adv_norm is not None
                     and self.adv_norm.mean_level not in (None, "batch", "group")
                 )
-                or any(
-                    norm is not None and norm.std_level == "logit-shift"
-                    for norm in (self.reward_norm, self.adv_norm)
-                )
             ):
                 raise ValueError(
                     "ckl_ctl requires standard PPO/GRPO loss and normalization; "
-                    "custom loss or logit-shift/MaxRL advantage shaping is unsupported"
+                    "custom loss or MaxRL advantage shaping is unsupported"
                 )
         if self.loss_type not in ("reinforce", "prob_sq"):
             raise ValueError(
-                "loss_type must be 'reinforce' or 'prob_sq'; configure logit-shift "
-                "with actor.adv_norm.mean_level='logit-shift' or "
-                "actor.reward_norm.std_level='logit-shift', "
-                f"got {self.loss_type!r}"
+                f"loss_type must be 'reinforce' or 'prob_sq', got {self.loss_type!r}"
             )
         if self.loss_type == "prob_sq" and (self.use_sapo_loss or self.use_cispo_loss):
             raise ValueError(
                 f"{self.loss_type} is mutually exclusive with SAPO and CISPO. "
                 "Disable use_sapo_loss and use_cispo_loss."
             )
-        if not math.isfinite(self.ls_clip) or self.ls_clip < 1:
-            raise ValueError(
-                f"ls_clip must be finite and at least 1, got {self.ls_clip!r}"
-            )
-        if not math.isfinite(self.ls_strength) or self.ls_strength < 0:
-            raise ValueError(
-                f"ls_strength must be finite and nonnegative, got {self.ls_strength!r}"
-            )
-        use_ls_refined = (
-            self.adv_norm is not None and self.adv_norm.mean_level == "ls-refined"
-        )
-        if use_ls_refined and (
-            self.loss_type != "reinforce" or self.use_sapo_loss or self.use_cispo_loss
-        ):
-            raise ValueError(
-                "ls-refined requires loss_type='reinforce' with SAPO and CISPO disabled"
-            )
-        use_logit_shift_reward = (
-            self.reward_norm is not None and self.reward_norm.std_level == "logit-shift"
-        )
-        use_logit_shift_advantage = self.adv_norm is not None and (
-            self.adv_norm.mean_level in ("logit-shift", "logit-shift-legacy", "maxls")
-        )
-        if self.reward_norm is not None and self.reward_norm.mean_level in (
-            "logit-shift",
-            "logit-shift-legacy",
-            "maxls",
-            "ls-refined",
-        ):
-            raise ValueError(
-                f"mean_level={self.reward_norm.mean_level!r} is only supported by "
-                "actor.adv_norm, not actor.reward_norm"
-            )
-        if (
-            use_logit_shift_advantage or use_ls_refined
-        ) and self.adv_norm.mean_leave1out:
-            raise ValueError(
-                "actor.adv_norm.mean_leave1out is not supported when "
-                "mean_level is 'logit-shift', 'logit-shift-legacy', 'maxls', "
-                "or 'ls-refined'"
-            )
-        if (
-            self.adv_norm is not None
-            and self.adv_norm.mean_level == "maxls"
-            and self.adv_norm.std_level is not None
-        ):
-            raise ValueError(
-                "actor.adv_norm.std_level must be None when mean_level='maxls'; "
-                "MaxLS is defined as MaxRL followed by per-sequence, "
-                "final-token-preserving logit-shift shaping"
-            )
-        if (
-            use_logit_shift_advantage or use_ls_refined
-        ) and self.importance_sampling_level != "token":
-            raise ValueError(
-                "actor.adv_norm.mean_level='logit-shift', "
-                "'logit-shift-legacy', 'maxls', or 'ls-refined' currently requires "
-                "importance_sampling_level='token'"
-            )
-        if use_logit_shift_reward and (use_logit_shift_advantage or use_ls_refined):
-            raise ValueError(
-                "reward logit-shift and advantage logit-shift/ls-refined "
-                "cannot be enabled together"
-            )
-        if (
-            use_logit_shift_reward or use_logit_shift_advantage or use_ls_refined
-        ) and not self.should_compute_prox_logp():
-            raise ValueError(
-                "logit-shift shaping or ls-refined requires a real "
-                "pre-update policy forward. Set actor.recompute_logprob=True, or "
-                "use decoupled PPO with prox_logp_method='recompute' or 'metrics'."
-            )
-
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(
