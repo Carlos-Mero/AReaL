@@ -140,7 +140,13 @@ def generate_dataset(config: NonIterativeSDConfig) -> None:
         raise ValueError(
             "MathAgent proxy generation requires scheduler.type=local or slurm"
         )
-    scheduler = schedulers[config.scheduler.type](exp_config=config)
+    # With direct script execution, NonIterativeSDConfig lives in __main__ and
+    # cannot be imported by RPC workers. Keep stage/output settings local and
+    # send only the framework's importable experiment config to every worker.
+    worker_config = GRPOConfig(
+        **{f.name: deepcopy(getattr(config, f.name)) for f in fields(GRPOConfig)}
+    )
+    scheduler = schedulers[config.scheduler.type](exp_config=worker_config)
     rollout = engine_cls.as_controller(rollout_config, scheduler)
     try:
         rollout.initialize(role="rollout", server_args=server_args)
