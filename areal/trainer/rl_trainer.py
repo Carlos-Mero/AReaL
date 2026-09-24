@@ -75,6 +75,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger("RLTrainer")
 
 
+def validate_self_distillation(config: PPOConfig) -> None:
+    """Validate pure OPD against a frozen, pre-update actor on each batch."""
+    if config.teacher is not None:
+        raise ValueError("Self-distillation cannot also use an external teacher")
+    if config.critic is not None:
+        raise ValueError("Pure OPD self-distillation does not use a critic")
+    actor = config.actor
+    if not actor.use_decoupled_loss or not actor.should_compute_prox_logp():
+        raise ValueError(
+            "Self-distillation requires use_decoupled_loss=True and real "
+            "pre-update log-probability recomputation (prox_logp_method=recompute)"
+        )
+    if not actor.disable_dropout:
+        raise ValueError("Self-distillation requires actor.disable_dropout=True")
+    if (
+        actor.loss_type != "reinforce"
+        or actor.use_sapo_loss
+        or actor.use_cispo_loss
+        or actor.kl_ctl != 0
+        or actor.ckl_ctl != 0
+    ):
+        raise ValueError(
+            "Pure OPD self-distillation requires loss_type=reinforce, "
+            "SAPO/CISPO disabled, and kl_ctl=ckl_ctl=0"
+        )
+
+
 class _EmptyDataLoader:
     """Minimal dataloader for online mode that yields empty dicts.
 
@@ -559,8 +586,21 @@ class PPOTrainer:
         eval_workflow_kwargs: dict[str, Any] | None = None,
         dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         total_epochs: int | None = None,
+        pre_update_actor_teacher: bool = False,
     ):
+        """Train, optionally using the pre-update actor as a pure OPD teacher.
+
+        The teacher is frozen for one rollout batch / ``ppo_update`` call. With
+        identical teacher and student distributions the initial KD gradient is
+        exactly zero. No separate teacher engine is allocated in this mode.
+        """
         config = self.config
+        if pre_update_actor_teacher:
+            validate_self_distillation(config)
+            logger.info(
+                "Pure OPD self-distillation: teacher is the pre-update actor; "
+                "identical teacher/student distributions give zero KD gradient."
+            )
         start_step = (
             self.recover_info.last_step_info.next().global_step
             if self.recover_info is not None
@@ -692,6 +732,12 @@ class PPOTrainer:
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
+
+            if pre_update_actor_teacher:
+                for traj in rollout_batch:
+                    # Log-probs may be remote tensors here. Clone the snapshot
+                    # on the actor worker after localization, before masking.
+                    traj["_pre_update_actor_teacher"] = True
 
             with (
                 stats_tracker.record_timing("compute_advantage"),

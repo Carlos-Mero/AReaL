@@ -239,6 +239,17 @@ class PPOActor:
     def _compute_advantages(
         self, data: dict[str, Any], adv_group_sizes: list[int] | None = None
     ) -> dict[str, Any]:
+        if data.pop("_pre_update_actor_teacher", False):
+            if data.get("prox_logp") is None:
+                raise ValueError("Self-distillation requires pre-update prox_logp")
+            if "teacher_logp" in data:
+                raise ValueError("Self-distillation cannot overwrite teacher_logp")
+            # Freeze scores on this batch, not another model copy. Clone before
+            # the advantage path can mask log-probs in place.
+            data["teacher_logp"] = data["prox_logp"].detach().clone()
+            data["rl_loss_weight"] = 0.0
+            data["distill_loss_weight"] = 1.0
+
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(

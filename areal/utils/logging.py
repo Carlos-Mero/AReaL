@@ -73,6 +73,7 @@ LOGGER_COLORS_EXACT = {
     # Trainers - green
     "RLTrainer": "light_green",
     "SFTTrainer": "light_green",
+    "SelfDistillation": "light_green",
     # Algorithm-specific - cyan
     "PPOActor": "cyan",
     # Rewards - purple
