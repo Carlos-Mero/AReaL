@@ -30,6 +30,7 @@ rollout:
   tokenizer_path: ${tokenizer_path}
   dump_to_file: false
   agent:
+    admin_api_key: "random-long-string"
     engine_max_tokens: ${gconfig.max_tokens}
     mode: inline
     export_style: individual
