@@ -143,8 +143,6 @@ stats_logger:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  swanlab:
-    mode: cloud
   wandb:
     mode: disabled
 perf_tracer:
