@@ -115,14 +115,17 @@ train_dataset:
   batch_size: 128
   shuffle: true
   pin_memory: true
-  num_workers: 4
+  # SFT expands this to 512 responses, each with three independent tensors.
+  # Collate in the controller to avoid file-descriptor exhaustion from IPC.
+  num_workers: 0
   path: EleutherAI/hendrycks_math
   type: rl
   max_length: 1024
 valid_dataset:
   batch_size: 128
   pin_memory: true
-  num_workers: 4
+  # Validation uses the same per-sample tensor collation as training.
+  num_workers: 0
   path: EleutherAI/hendrycks_math
   type: rl
 saver:
