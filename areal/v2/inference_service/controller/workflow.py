@@ -15,6 +15,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import deserialize_value
 from areal.infra.utils.http import async_http_retry
 from areal.utils import logging, stats_tracker
+from areal.utils.conditional_entropy import record_conditional_entropies
 
 if TYPE_CHECKING:
     from areal.api.engine_api import InferenceEngine
@@ -58,6 +59,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
+        log_binary_conditional_entropy: bool = True,
     ):
         self.controller = controller
         self.agent = agent
@@ -72,6 +74,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
         self.min_usable_group_size = min_usable_group_size
+        self.log_binary_conditional_entropy = log_binary_conditional_entropy
 
     @async_http_retry
     async def _start_session(
@@ -142,6 +145,7 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             "reward_normalization": self.reward_normalization,
             "discard_trajectory": discard_trajectory,
             "is_eval": workflow_context.get().is_eval,
+            "log_binary_conditional_entropy": self.log_binary_conditional_entropy,
             "min_usable_group_size": min_usable_group_size,
         }
         if export_session_ids is not None:
@@ -157,6 +161,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             # Outside the HTTP retry boundary, and before the empty-trajectory
             # check: these are scoring observations, not training acceptance stats.
             stats.record(is_eval=payload["is_eval"])
+        if entropies := data.get("conditional_entropies"):
+            record_conditional_entropies(entropies)
         return traj
 
     @async_http_retry

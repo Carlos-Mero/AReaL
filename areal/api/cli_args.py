@@ -3313,6 +3313,14 @@ class InferenceEngineConfig:
             "help": "Whether to output verbose tracing messages for each generation request."
         },
     )
+    log_binary_conditional_entropy: bool = field(
+        default=True,
+        kw_only=True,
+        metadata={
+            "help": "Log true and false sequence entropy estimates for single-turn "
+            "training rollouts with binary rewards, using raw token logprobs."
+        },
+    )
     deterministic_sampling: bool = field(
         default=False,
         metadata={

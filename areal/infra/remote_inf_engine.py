@@ -52,6 +52,10 @@ from areal.infra.utils.http import (
 from areal.infra.utils.launcher import wait_llm_server_addrs
 from areal.infra.utils.proc import kill_process_tree
 from areal.utils import logging, name_resolve, names, stats_tracker
+from areal.utils.conditional_entropy import (
+    binary_conditional_entropies,
+    record_conditional_entropies,
+)
 from areal.utils.data import RolloutGroup, concat_padded_tensors, get_batch_size
 from areal.utils.dynamic_import import bind_filter_kwargs, import_from_string
 from areal.utils.network import (
@@ -93,6 +97,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         drop_incomplete_group: bool = False,
         min_usable_group_size: int = 1,
         reward_normalization_use_std: bool = True,
+        log_binary_conditional_entropy: bool = True,
     ):
         validate_rollout_group_sizes(group_size, min_usable_group_size)
         self.workflow = workflow
@@ -102,6 +107,7 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self.reward_normalization_use_std = reward_normalization_use_std
         self.reward_normalization = reward_normalization
         self.drop_incomplete_group = drop_incomplete_group
+        self.log_binary_conditional_entropy = log_binary_conditional_entropy
 
     def _record_group_stats(self, usable_slot_count: int, *, trainable: bool) -> None:
         trainable_slot_count = usable_slot_count if trainable else 0
@@ -223,6 +229,9 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
                 record_group_metrics(data, rewards, self.group_size)
         if group_error is not None:
             raise group_error
+
+        if self.log_binary_conditional_entropy and not group_context.is_eval:
+            record_conditional_entropies(binary_conditional_entropies(results))
 
         if interaction_group and self.reward_normalization and self.group_size > 1:
             # An unscored branch invalidates its logical rollout, not scored
@@ -928,6 +937,7 @@ class RemoteInfEngine(InferenceEngine):
                     reward_normalization_use_std=reward_normalization_use_std,
                     drop_incomplete_group=drop_incomplete_group,
                     min_usable_group_size=min_usable_group_size,
+                    log_binary_conditional_entropy=self.config.log_binary_conditional_entropy,
                 )
             return resolved
 
@@ -1027,6 +1037,7 @@ class RemoteInfEngine(InferenceEngine):
                 reward_normalization_use_std=reward_normalization_use_std,
                 drop_incomplete_group=drop_incomplete_group,
                 min_usable_group_size=min_usable_group_size,
+                log_binary_conditional_entropy=self.config.log_binary_conditional_entropy,
             )
 
         return resolved

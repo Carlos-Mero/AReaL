@@ -40,6 +40,7 @@ from areal.infra.rpc.rtensor import RTensor
 from areal.infra.rpc.serialization import serialize_value
 from areal.infra.utils.http import create_httpx_client
 from areal.utils import logging
+from areal.utils.conditional_entropy import binary_conditional_entropies
 from areal.utils.data import is_multi_modal_key
 from areal.utils.dynamic_import import import_from_string
 from areal.utils.seeding import derive_deterministic_seed
@@ -989,6 +990,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 except KeyError:
                     grouped_interactions.append(None)
 
+            conditional_entropies = {}
+            if body.log_binary_conditional_entropy and not body.is_eval:
+                conditional_entropies = binary_conditional_entropies(
+                    grouped_interactions
+                )
+
             prm_stats = None
             if body.discard_trajectory:
                 grouped_interactions = []
@@ -1102,9 +1109,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 traj = concat_string_interactions(merged)
 
             serialized = serialize_value(traj)
+            response = ExportTrajectoriesResponse(traj=serialized)
+            if conditional_entropies:
+                response.conditional_entropies = conditional_entropies
             if prm_stats is not None:
-                return ExportTrajectoriesResponse(traj=serialized, prm_stats=prm_stats)
-            return ExportTrajectoriesResponse(traj=serialized)
+                response.prm_stats = prm_stats
+            return response
         finally:
             if body.remove_session:
                 for sid, session in owned_sessions.items():

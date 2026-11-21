@@ -1779,6 +1779,7 @@ class RolloutControllerV2:
             export_style=export_style,
             group_size=group_size,
             serialize_group_samples=self.config.serialize_group_samples,
+            log_binary_conditional_entropy=self.config.log_binary_conditional_entropy,
             drop_retry_orphans=agent_cfg.drop_retry_orphans,
             reward_normalization=reward_normalization,
             drop_incomplete_group=drop_incomplete_group,
@@ -1853,6 +1854,10 @@ class RolloutControllerV2:
             online_kwargs.pop("controller", None)
             online_kwargs.setdefault(
                 "drop_retry_orphans", self._agent_config.drop_retry_orphans
+            )
+            online_kwargs.setdefault(
+                "log_binary_conditional_entropy",
+                self.config.log_binary_conditional_entropy,
             )
             if self._agent_config.prm.enabled and self._agent_config.prm.scorers:
                 online_kwargs.setdefault(

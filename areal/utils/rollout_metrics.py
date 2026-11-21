@@ -14,6 +14,7 @@ from threading import Lock
 from typing import Any, Protocol, TypeVar
 
 Metrics = dict[str, list[float]]
+CONDITIONAL_ENTROPY_KEYS = ("false_conditional_entropy", "true_conditional_entropy")
 _CAPTURE: ContextVar[Metrics | None] = ContextVar("rollout_metrics", default=None)
 _DENOMINATORS = {
     "reward": "reward_sample_count",
@@ -88,6 +89,9 @@ class ConsumedMetrics:
             if values:
                 result[key] = sum(values) / len(values)
                 result[f"{key}__count"] = len(values)
+        if any(f"rollout/{key}" in metrics for key in CONDITIONAL_ENTROPY_KEYS):
+            for key in CONDITIONAL_ENTROPY_KEYS:
+                result[f"rollout/{key}_count"] = len(metrics.get(f"rollout/{key}", ()))
         # StatsLogger hides internal __count companions. Publish denominators
         # explicitly so dashboards can distinguish episodes, groups and Arena calls.
         for key, values in metrics.items():

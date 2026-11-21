@@ -46,6 +46,10 @@ from areal.experimental.openai.types import (
     concat_tensor_interactions,
 )
 from areal.utils import logging, perf_tracer, stats_tracker
+from areal.utils.conditional_entropy import (
+    binary_conditional_entropies,
+    record_conditional_entropies,
+)
 from areal.infra.utils.concurrent import get_executor
 from areal.utils.data import RolloutGroup, cycle_dataloader
 from areal.utils.perf_tracer import trace_perf, trace_session_event
@@ -1391,6 +1395,24 @@ class WorkflowExecutor:
                     async with backend_session(self.inference_engine):
                         traj = await pending_task.workflow.arun_episode(
                             self.inference_engine, workflow_data
+                        )
+
+                # Unwrapped singletons bypass the group recorder. Wrapped tensor
+                # groups carry rollout_group and merged interactions carry an index.
+                if (
+                    self.config.log_binary_conditional_entropy
+                    and not pending_task.is_eval
+                    and traj
+                    and "rollout_group" not in traj
+                ):
+                    single = next(iter(traj.values()))
+                    if "input_ids" in traj or (
+                        len(traj) == 1
+                        and isinstance(single, InteractionWithTokenLogpReward)
+                        and single.rollout_index is None
+                    ):
+                        record_conditional_entropies(
+                            binary_conditional_entropies([traj])
                         )
 
                 # Trajectory format checking

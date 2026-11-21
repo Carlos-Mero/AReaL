@@ -87,6 +87,7 @@ class ExportTrajectoriesRequest(BaseModel):
     reward_normalization: bool = False
     discard_trajectory: bool = False
     is_eval: bool = False
+    log_binary_conditional_entropy: bool = True
 
 
 class ExportTrajectoriesResponse(BaseModel):
@@ -94,6 +95,7 @@ class ExportTrajectoriesResponse(BaseModel):
 
     traj: dict[str, Any]
     prm_stats: PRMExportStats | None = None
+    conditional_entropies: dict[str, list[float]] | None = None
 
 
 @dataclass(frozen=True)
