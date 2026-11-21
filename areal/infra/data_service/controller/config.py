@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from areal.api.cli_args import SchedulingSpec, SchedulingStrategy
+from areal.api.cli_args import SchedulingSpec, SchedulingStrategy, TrainDatasetConfig
 
 
 @dataclass
@@ -25,7 +25,7 @@ class DataServiceConfig:
     scheduling_strategy: SchedulingStrategy = field(
         default_factory=lambda: SchedulingStrategy(type="separation"),
     )
-    setup_timeout: float = 120.0
+    setup_timeout: float = TrainDatasetConfig.setup_timeout
     dataloader_num_workers: int = 4
     seed: int = 42
 
