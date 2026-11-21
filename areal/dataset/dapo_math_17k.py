@@ -9,12 +9,11 @@ from areal.utils.hf_utils import apply_chat_template
 
 def get_dapo_math_17k_rl_dataset(
     path: str,
-    split: str,
+    split: str | None,
     tokenizer,
     max_length: int | None = None,
 ) -> Dataset:
-    """Load local DAPO-Math-17k parquet data for RL training."""
-    del split
+    """Load DAPO-Math-17k from the Hugging Face Hub or a local directory."""
     dataset_root = Path(path)
     parquet_files = sorted((dataset_root / "data").glob("*.parquet"))
     json_files = sorted(dataset_root.glob("*.jsonl")) + sorted(
@@ -32,6 +31,8 @@ def get_dapo_math_17k_rl_dataset(
             data_files=[str(data_file) for data_file in json_files],
             split="train",
         )
+    elif path == "BytedTsinghua-SIA/DAPO-Math-17k" and not dataset_root.exists():
+        dataset = load_dataset(path, split=split or "train")
     else:
         raise FileNotFoundError(
             f"No parquet or JSON data files found under {dataset_root}"
