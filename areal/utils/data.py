@@ -451,10 +451,20 @@ class RolloutGroup:
     row_counts: tuple[int, ...]
     rewards: tuple[float | None, ...] = ()
     arena_stream_name: str | None = None
+    # Before rollout-time normalization, when applied.
+    original_rewards: tuple[float | None, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "row_counts", tuple(self.row_counts))
         object.__setattr__(self, "rewards", tuple(self.rewards))
+        object.__setattr__(self, "original_rewards", tuple(self.original_rewards))
+        if self.original_rewards and (
+            len(self.original_rewards) != len(self.row_counts)
+            or not all(r is None or math.isfinite(r) for r in self.original_rewards)
+        ):
+            raise ValueError(
+                "original_rewards must match row_counts and be finite when provided"
+            )
         if not self.row_counts or any(
             type(count) is not int or count < 1 for count in self.row_counts
         ):
@@ -472,7 +482,9 @@ class RolloutGroup:
     def validate_rows(self, rows: int) -> "RolloutGroup":
         # RPC restores dataclass fields without running the constructor and
         # encodes tuples as lists. Revalidate at the consuming boundary.
-        group = RolloutGroup(self.row_counts, self.rewards, self.arena_stream_name)
+        group = RolloutGroup(
+            self.row_counts, self.rewards, self.arena_stream_name, self.original_rewards
+        )
         if sum(group.row_counts) != rows:
             raise ValueError(
                 f"rollout row_counts sum to {sum(group.row_counts)}, expected {rows}"

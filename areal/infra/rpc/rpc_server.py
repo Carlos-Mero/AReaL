@@ -15,6 +15,7 @@ Usage::
 from __future__ import annotations
 
 import logging as stdlib_logging
+import resource
 
 from areal.infra.rpc.guard.app import (
     GuardState,
@@ -25,9 +26,31 @@ from areal.infra.rpc.guard.app import (
 )
 from areal.infra.rpc.guard.data_blueprint import data_bp
 from areal.infra.rpc.guard.engine_blueprint import engine_bp, register_engine_hooks
+from areal.infra.utils.http import HTTPX_MAX_CONNECTIONS
 from areal.utils import logging, perf_tracer
 
 logger = logging.getLogger("SyncRPCServer")
+
+
+def _configure_nofile_limit() -> None:
+    """Budget descriptors for incoming RPCs, proxy connections and engine I/O."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = 4 * HTTPX_MAX_CONNECTIONS
+    if soft == resource.RLIM_INFINITY or soft >= target:
+        return
+    limit = target if hard == resource.RLIM_INFINITY else min(target, hard)
+    if limit > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not raise the open-file limit from %d: %s", soft, exc)
+            return
+    if limit < target:
+        logger.warning(
+            "Worker open-file limit is capped at %d. High rollout concurrency "
+            "may require a higher hard limit.",
+            limit,
+        )
 
 
 def main():
@@ -43,6 +66,7 @@ def main():
     )
 
     args, _ = parser.parse_known_args()
+    _configure_nofile_limit()
 
     werkzeug_logger = stdlib_logging.getLogger("werkzeug")
     werkzeug_logger.setLevel(getattr(stdlib_logging, args.werkzeug_log_level))

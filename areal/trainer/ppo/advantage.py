@@ -4,7 +4,7 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from functools import partial
+from functools import cached_property, partial
 from typing import Any
 
 import torch
@@ -22,6 +22,11 @@ from areal.trainer.ppo.advantage_algorithms import (
 )
 from areal.trainer.ppo.lambda_fn import resolve_gae_lambda_fn
 from areal.trainer.ppo.stats import log_train_inference_stats
+from areal.utils.conditional_kl import (
+    ConditionalKL,
+    estimate_batch_ckl,
+    response_prediction_mask,
+)
 from areal.utils.data import (
     KLEstimator,
     Normalization,
@@ -41,6 +46,37 @@ class AdvantageInputs:
     meta: TrajBatchMeta | None = None
     process_implementation: str = "additive"
     process_kwargs: Mapping[str, Any] = field(default_factory=dict)
+
+    @cached_property
+    def reference_ckl(self) -> ConditionalKL | None:
+        """Share the pre-shaping estimate between diagnostics and the reward."""
+        ref = self.data.get("ref_logp")
+        if self.config.ckl_ctl and (self.meta is None or ref is None):
+            raise ValueError("ckl_ctl requires prompt group metadata and ref_logp")
+        if (
+            not self.config.uses_reference_policy()
+            or ref is None
+            or self.meta is None
+            or max(self.meta.logical_group_sizes) < 2
+        ):
+            return None
+        return estimate_batch_ckl(
+            self.data, ref, self.meta, require_outcomes=self.config.ckl_ctl > 0
+        )
+
+    def record_ckl(self) -> None:
+        if self.reference_ckl is not None:
+            self.reference_ckl.record("ppo_actor/actor_ref_ckl")
+        teacher = self.data.get("teacher_logp")
+        if (
+            teacher is not None
+            and self.data.get("distill_loss_weight", 0.005) != 0
+            and self.meta is not None
+            and max(self.meta.logical_group_sizes) >= 2
+        ):
+            estimate_batch_ckl(self.data, teacher, self.meta).record(
+                "ppo_actor/student_teacher_ckl"
+            )
 
 
 @dataclass(frozen=True)
@@ -295,6 +331,7 @@ class AdvantagePipeline:
     def __call__(self, inputs: AdvantageInputs) -> AdvantageResult:
         data = dict(inputs.data)
         meta = inputs.meta
+        ckl = inputs.reference_ckl if self.config.ckl_ctl else None
         process = self.process or _resolve_function(
             AdvantageFunctionConfig(implementation=inputs.process_implementation),
             PROCESS_COMPOSERS,
@@ -419,15 +456,19 @@ class AdvantagePipeline:
         ref_logp = data.get("ref_logp")
         if ref_logp is None:
             ref_logp = torch.zeros_like(old_logp)
-        ref_logp *= loss_mask
-        old_logp *= loss_mask
+        ref_logp.masked_fill_(~loss_mask.bool(), 0.0)
+        old_logp.masked_fill_(~loss_mask.bool(), 0.0)
 
         # Compute KL-regularized rewards.
         attn_mask = data["attention_mask"]
         seqlens = attn_mask.sum(-1).long()
         seq_truncated_mask = _get_truncated_mask(data, seqlens)
         data["is_truncated"] = seq_truncated_mask
-        rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
+        rewards = (
+            -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
+            if self.kl_ctl
+            else torch.zeros_like(old_logp)
+        )
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
@@ -440,6 +481,17 @@ class AdvantagePipeline:
             )
         else:
             gae_outcome_rewards[batch_indices, indices] = reward_score
+        if ckl is not None:
+            # One sequence reward at the last generated action. Each disjoint
+            # row of a split response carries its portion of the policy score.
+            response_mask = response_prediction_mask(data)
+            last_action = (
+                response_mask.shape[-1] - 1 - response_mask.flip([-1]).int().argmax(-1)
+            )
+            penalty = (-self.config.ckl_ctl * ckl.signal).to(rewards.dtype)
+            penalty = torch.where(response_mask.any(-1), penalty, 0.0)
+            gae_outcome_rewards[batch_indices, last_action] += penalty
+            kl_rewards[batch_indices, last_action] = penalty
 
         process_rewards = None
         token_advantages = None

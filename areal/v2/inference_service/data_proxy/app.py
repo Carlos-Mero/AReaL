@@ -1082,6 +1082,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 for interaction in interactions.values():
                     interaction.rollout_index = rollout_index
                     interaction.rollout_reward = last_interaction.reward
+                    interaction.original_rollout_reward = (
+                        last_interaction.original_reward
+                    )
                 merged.update(interactions)
 
             configure_r3_interactions(

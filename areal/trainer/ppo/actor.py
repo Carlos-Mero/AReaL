@@ -404,19 +404,21 @@ class PPOActor:
         gvpo_zero_penalty: float = 0.4,
         gvpo_zero_eps: float = 1e-6,
     ) -> dict[str, Any]:
-        result = self.advantage_fn(
-            AdvantageInputs(
-                data=data,
-                config=self.config,
-                meta=meta,
-                process_implementation=advantage_shaping_mode,
-                process_kwargs={
-                    "negative_scale": gvpo_negative_scale,
-                    "zero_penalty": gvpo_zero_penalty,
-                    "zero_eps": gvpo_zero_eps,
-                },
-            )
+        if "teacher_token_logp" in data:
+            data["teacher_logp"] = data.pop("teacher_token_logp").roll(-1, dims=-1)
+        inputs = AdvantageInputs(
+            data=data,
+            config=self.config,
+            meta=meta,
+            process_implementation=advantage_shaping_mode,
+            process_kwargs={
+                "negative_scale": gvpo_negative_scale,
+                "zero_penalty": gvpo_zero_penalty,
+                "zero_eps": gvpo_zero_eps,
+            },
         )
+        inputs.record_ckl()
+        result = self.advantage_fn(inputs)
         data.update(validate_advantage_result(result, data))
         if self.config.use_score_centering:
             for key in ("sampler_head_ids", "sampler_head_logprobs"):

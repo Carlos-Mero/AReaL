@@ -264,7 +264,7 @@ class PPOTrainer:
         requires_ref = (
             self.mopd_execution_plan.requires_ref
             if self.mopd_execution_plan is not None
-            else config.actor.kl_ctl > 0 and config.ref is not None
+            else config.actor.uses_reference_policy() and config.ref is not None
         )
         self._should_offload_critic = bool(
             requires_critic and config.critic is not None and config.critic.offload
@@ -1052,7 +1052,14 @@ class PPOTrainer:
                         [without_r3_tensors(traj) for traj in rollout_batch]
                     )
                     for traj, logp in zip(rollout_batch, teacher_logps):
-                        traj["teacher_logp"] = logp
+                        # Rollout engines score input token positions. Train
+                        # engines already return next-token prediction scores.
+                        key = (
+                            "teacher_token_logp"
+                            if self.config.teacher.engine_type == "rollout"
+                            else "teacher_logp"
+                        )
+                        traj[key] = logp
                         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
                         traj["distill_loss_weight"] = (
                             self.config.teacher.distill_loss_weight
@@ -1538,7 +1545,7 @@ class PPOTrainer:
                     ModelAllocation.from_str(self.config.critic.backend, name="critic"),
                 )
             )
-        if self.config.actor.kl_ctl > 0 and self.config.ref is not None:
+        if self.config.actor.uses_reference_policy() and self.config.ref is not None:
             engine_cfgs.append(
                 (
                     self.config.ref,

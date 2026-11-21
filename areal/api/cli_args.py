@@ -2125,6 +2125,13 @@ class PPOActorConfig(TrainEngineConfig):
 
     # KL Control
     kl_ctl: float = field(default=0.1, metadata={"help": "KL divergence coefficient"})
+    ckl_ctl: float = field(
+        default=0.0,
+        metadata={
+            "help": "Conditional KL reward coefficient for successful responses. "
+            "Requires a reference model and kl_ctl=0 when positive."
+        },
+    )
     kl_estimator: str = field(
         default="k1",
         metadata={"help": "KL divergence estimator", "choices": ["k1", "k2", "k3"]},
@@ -2270,6 +2277,10 @@ class PPOActorConfig(TrainEngineConfig):
             return min(2, target_group_size)
         return 1
 
+    def uses_reference_policy(self) -> bool:
+        """Whether the RL objective needs reference log probabilities."""
+        return self.kl_ctl > 0 or self.ckl_ctl > 0
+
     def should_compute_prox_logp(self) -> bool:
         """Determine if forward pass is needed for proximal log-probabilities.
 
@@ -2285,6 +2296,10 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if not math.isfinite(self.ckl_ctl) or self.ckl_ctl < 0:
+            raise ValueError("ckl_ctl must be finite and nonnegative")
+        if self.ckl_ctl > 0 and self.kl_ctl != 0:
+            raise ValueError("kl_ctl and ckl_ctl are mutually exclusive")
         if isinstance(self.advantage, (dict, DictConfig)):
             self.advantage = AdvantageConfig(**dict(self.advantage))
         if not isinstance(self.advantage, AdvantageConfig):
@@ -4506,6 +4521,8 @@ class PPOConfig(BaseExperimentConfig):
 
     def __post_init__(self):
         """Validate the eval generation config."""
+        if self.actor.ckl_ctl > 0 and self.ref is None:
+            raise ValueError("ckl_ctl requires a reference model in ref")
         if self.teacher is not None and self.mopd is not None:
             raise ValueError("teacher and mopd cannot be configured at the same time")
         if self.mopd is not None:

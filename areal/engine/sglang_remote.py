@@ -34,7 +34,7 @@ from areal.engine.r3.preprocess import decode_sglang_routed_experts
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
-from areal.infra.workflow_executor import WorkflowTaskResult
+from areal.infra.workflow_executor import WorkflowContractFailure, WorkflowTaskResult
 from areal.utils import perf_tracer, stats_tracker
 from areal.utils.logging import getLogger
 from areal.utils.network import find_free_ports, format_host_for_url
@@ -299,12 +299,12 @@ class SGLangBackend:
         if meta_info is None:
             raise ValueError("SGLang response missing meta_info for score request")
         # SGLang returns [logprob, token_id, ...]
-        all_logprobs = [float(x[0]) for x in meta_info.get("input_token_logprobs", [])]
+        all_logprobs = meta_info.get("input_token_logprobs", [])
         if len(all_logprobs) < target_len:
             raise ValueError(
                 f"SGLang returned insufficient input_token_logprobs: {len(all_logprobs)} < {target_len}"
             )
-        return all_logprobs[-target_len:]
+        return [float(x[0]) for x in all_logprobs[-target_len:]]
 
     def build_disk_weight_update_requests(
         self, meta: WeightUpdateMeta
@@ -862,9 +862,17 @@ class RemoteSGLangEngine(InferenceEngine):
         """Wait for a specified number of requests to complete."""
         return self._engine.wait(count, timeout, raise_timeout)
 
+    def prepare_rollout_result(
+        self, task_id: int, node_addr: str, timeout: float
+    ) -> dict[str, Any] | WorkflowContractFailure | None:
+        return self._engine.prepare_rollout_result(task_id, node_addr, timeout)
+
+    def release_rollout_result(self, task_id: int, discard: bool = False) -> None:
+        self._engine.release_rollout_result(task_id, discard)
+
     def get_rollout_result(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any] | WorkflowContractFailure | None:
         """Transfer the trajectory and quality metrics to the rollout consumer."""
         return self._engine.get_rollout_result(task_id, timeout, raise_timeout)
 

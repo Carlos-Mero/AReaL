@@ -306,6 +306,7 @@ def serialize_interactions(
                 "interaction_id": interaction.interaction_id,
             }
         result[key]["rollout_reward"] = interaction.rollout_reward
+        result[key]["original_rollout_reward"] = interaction.original_rollout_reward
         result[key]["rollout_index"] = interaction.rollout_index
         result[key]["metadata"] = dict(interaction.metadata)
     if tensor_store is not None:
@@ -331,6 +332,7 @@ def deserialize_interactions(
             interaction.output_message_list = item["output_message_list"]
         interaction.reward = item["reward"]
         interaction.rollout_reward = item.get("rollout_reward")
+        interaction.original_rollout_reward = item.get("original_rollout_reward")
         interaction.rollout_index = item.get("rollout_index")
         interaction.interaction_id = item["interaction_id"]
         interaction.metadata = dict(item.get("metadata") or {})

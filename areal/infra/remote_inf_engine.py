@@ -42,7 +42,8 @@ from areal.api.io_struct import (
 )
 from areal.infra import workflow_context
 from areal.infra.platforms import current_platform
-from areal.infra.utils.concurrent import get_executor
+from areal.infra.rpc.rtensor import RTensor
+from areal.infra.utils.concurrent import get_executor, run_async_task
 from areal.infra.utils.http import (
     _read_http_error_body,
     arequest_with_retry,
@@ -598,6 +599,9 @@ class RemoteInfEngine(InferenceEngine):
         self.lock = Lock()
 
         self._workflow_executor: WorkflowExecutor | None = None
+        self._unacknowledged_rollouts: dict[
+            int, dict[str, Any] | WorkflowContractFailure | None
+        ] = {}
         self._initialized = False
         self._destroy_callbacks: dict[str, Callable[[], None]] = {}
         self._destroy_callbacks_lock = Lock()
@@ -736,7 +740,15 @@ class RemoteInfEngine(InferenceEngine):
         self._initialized = False
         try:
             if self._workflow_executor is not None:
-                self._workflow_executor.destroy()
+                try:
+                    if self._unacknowledged_rollouts:
+                        run_async_task(
+                            self._workflow_executor._clear_rejected_trajectory,
+                            self._unacknowledged_rollouts,
+                        )
+                finally:
+                    self._unacknowledged_rollouts.clear()
+                    self._workflow_executor.destroy()
         finally:
             self._run_destroy_callbacks()
             if len(self.local_server_processes) > 0:
@@ -805,16 +817,21 @@ class RemoteInfEngine(InferenceEngine):
             bs = input_ids.shape[0]
             out = torch.zeros_like(loss_mask, dtype=torch.float32)
             for i in range(bs):
-                token_ids = input_ids[i].tolist()
-                target_len = int(loss_mask[i].sum().item())
-                if target_len <= 0:
+                active = (
+                    traj["attention_mask"][i].nonzero().flatten()
+                    if "attention_mask" in traj
+                    else torch.arange(input_ids.shape[1], device=input_ids.device)
+                )
+                # Score the span containing the generated tokens. Multi-turn
+                # observations inside it supply context but are not targets.
+                offsets = loss_mask[i, active].nonzero().flatten()
+                # The first input token has no preceding logit.
+                offsets = offsets[offsets > 0]
+                if not offsets.numel():
                     continue
-                if "attention_mask" in traj:
-                    attn_mask = traj["attention_mask"][i]
-                    active_idx = torch.nonzero(attn_mask, as_tuple=False).squeeze(-1)
-                    token_ids = input_ids[i, active_idx].tolist()
-                else:
-                    token_ids = input_ids[i].tolist()
+                start, end = int(offsets[0]), int(offsets[-1]) + 1
+                token_ids = input_ids[i, active[:end]].tolist()
+                target_len = end - start
                 server_addr = self.choose_server()
                 http_req = self.backend.build_score_request(
                     input_ids=token_ids,
@@ -835,10 +852,8 @@ class RemoteInfEngine(InferenceEngine):
                     raise ValueError(
                         f"Expected {target_len} token logprobs, got {len(token_logps)}"
                     )
-                write_idx = torch.nonzero(loss_mask[i], as_tuple=False).squeeze(-1)
-                out[i, write_idx] = torch.tensor(
-                    token_logps, device=out.device, dtype=out.dtype
-                )
+                scores = torch.tensor(token_logps, device=out.device, dtype=out.dtype)
+                out[i, active[offsets]] = scores[offsets - start]
             results.append(out)
         return results
 
@@ -1644,10 +1659,27 @@ class RemoteInfEngine(InferenceEngine):
             count, timeout=timeout, raise_timeout=raise_timeout
         )
 
+    def prepare_rollout_result(
+        self, task_id: int, node_addr: str, timeout: float
+    ) -> dict[str, Any] | WorkflowContractFailure | None:
+        """Stage a completed rollout once across retries on the serial RPC thread."""
+        if task_id not in self._unacknowledged_rollouts:
+            result = self.get_rollout_result(task_id, timeout, raise_timeout=True)
+            self._unacknowledged_rollouts[task_id] = RTensor.remotize(
+                result, node_addr=node_addr, preserve_tensor_aliases=True
+            )
+        return self._unacknowledged_rollouts[task_id]
+
+    def release_rollout_result(self, task_id: int, discard: bool = False) -> None:
+        """Transfer shard ownership to the controller, or clean up a failed delivery."""
+        result = self._unacknowledged_rollouts.pop(task_id, None)
+        if discard and isinstance(result, dict):
+            run_async_task(self.workflow_executor._clear_rejected_trajectory, result)
+
     def get_rollout_result(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
-    ) -> dict[str, Any] | None:
-        """Transfer a result and its metrics without consuming them on the worker."""
+    ) -> dict[str, Any] | WorkflowContractFailure | None:
+        """Dequeue a result and leave its metrics for the controller to consume."""
         result = self.workflow_executor.dispatcher.wait_for_task(
             task_id, timeout, raise_timeout, consume=False, raise_terminal_error=False
         )

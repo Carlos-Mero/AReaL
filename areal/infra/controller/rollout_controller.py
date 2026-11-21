@@ -1210,6 +1210,56 @@ class RolloutController:
             f"rejected: {stats.rejected}."
         )
 
+    async def _fetch_rollout_result(
+        self, worker: Worker, engine_name: str, task_id: int
+    ) -> dict[str, Any] | WorkflowContractFailure | None:
+        if not hasattr(self.inf_engine, "prepare_rollout_result"):
+            # External engines may implement only the original one-shot reader.
+            return await self.scheduler.async_call_engine(
+                worker.id,
+                "get_rollout_result",
+                engine_name=engine_name,
+                task_id=task_id,
+                timeout=0.1,
+                raise_timeout=False,
+                http_timeout=self.config.request_timeout,
+            )
+
+        # The completion callback guarantees readiness. Retried reads must return
+        # the same shard IDs until this controller has received the envelope.
+        received = False
+        try:
+            result = await self.scheduler.async_call_engine(
+                worker.id,
+                "prepare_rollout_result",
+                engine_name=engine_name,
+                task_id=task_id,
+                node_addr=format_hostport(worker.ip, int(worker.worker_ports[0])),
+                timeout=0.1,
+                http_timeout=self.config.request_timeout,
+            )
+            received = True
+            return result
+        finally:
+            try:
+                await self.scheduler.async_call_engine(
+                    worker.id,
+                    "release_rollout_result",
+                    engine_name=engine_name,
+                    task_id=task_id,
+                    discard=not received,
+                    http_timeout=self.config.request_timeout,
+                )
+            except Exception:
+                # Once received, the controller owns the shards even if its
+                # acknowledgement is lost. Keep the original result or error.
+                logger.warning(
+                    "Could not release rollout result %d on %s",
+                    task_id,
+                    worker.id,
+                    exc_info=True,
+                )
+
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
         async def _submit_then_wait() -> WorkflowTaskResult | None:
             # NOTE: No need to call `on_rollout_submitted` here.
@@ -1257,16 +1307,7 @@ class RolloutController:
                 # Wait for callback to resolve the future
                 await asyncio.wait_for(future, timeout=self.config.request_timeout)
 
-                # Fetch the result
-                result = await self.scheduler.async_call_engine(
-                    worker.id,
-                    "get_rollout_result",
-                    engine_name=engine_name,
-                    task_id=engine_task_id,
-                    timeout=0.1,  # A short time to prevent blocking other requests
-                    raise_timeout=False,
-                    http_timeout=self.config.request_timeout,
-                )
+                result = await self._fetch_rollout_result(worker, engine_name, task_id)
 
                 if isinstance(result, WorkflowContractFailure):
                     manager.on_rollout_rejected()

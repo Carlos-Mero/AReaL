@@ -73,6 +73,7 @@ class InteractionWithTokenLogpReward:
 
     # Per-interaction dump metadata, kept separate from training tensors.
     metadata: dict[str, Any] = field(default_factory=dict)
+    original_rollout_reward: float | None = None
 
     @property
     def has_tensor_data(self) -> bool:
@@ -380,6 +381,7 @@ def concat_tensor_interactions(
     batches = []
     counts: list[int] = []
     rewards: list[float | None] = []
+    raw_references: list[float | None] = []
     members: dict[int, list[InteractionWithTokenLogpReward]] = {}
     for interaction in interactions.values():
         index = (
@@ -391,8 +393,15 @@ def concat_tensor_interactions(
         batches.extend(tensors)
         counts.append(sum(get_batch_size(t) for t in tensors))
         rewards.append(_interaction_rollout_reward(member))
+        raw_references.append(member[0].original_rollout_reward)
     result = concat_padded_tensors(batches)
-    result["rollout_group"] = RolloutGroup(tuple(counts), tuple(rewards))
+    result["rollout_group"] = RolloutGroup(
+        tuple(counts),
+        tuple(rewards),
+        original_rewards=tuple(raw_references)
+        if any(r is not None for r in raw_references)
+        else (),
+    )
     return result
 
 
@@ -477,12 +486,15 @@ def normalize_logical_rollout_rewards(
     )
     normalized_rows = iter(((row_rewards - mean) / scale).tolist())
     normalized_references = ((rewards - mean) / scale).tolist()
-    for result, reference in zip(results, normalized_references):
+    for result, reference, raw_reference in zip(
+        results, normalized_references, references
+    ):
         assert result is not None
         for interaction in result.values():
             interaction.original_reward = interaction.reward
             interaction.reward = next(normalized_rows)
             interaction.rollout_reward = reference
+            interaction.original_rollout_reward = raw_reference
             if interaction._cache is not None:
                 # Cached exports can contain more than one physical row.
                 cache = interaction._cache

@@ -33,7 +33,7 @@ from areal.api.io_struct import (
 from areal.infra import RemoteInfEngine, RolloutController, WorkflowExecutor
 from areal.infra.platforms import current_platform
 from areal.infra.utils.launcher import TRITON_CACHE_PATH
-from areal.infra.workflow_executor import WorkflowTaskResult
+from areal.infra.workflow_executor import WorkflowContractFailure, WorkflowTaskResult
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.network import format_host_for_url
 from areal.utils.vllm_response import parse_vllm_generation_response
@@ -137,9 +137,8 @@ class VLLMBackend:
             "prompt": input_ids,
             "max_tokens": 1,
             "temperature": 0.0,
-            "logprobs": 1,
-            "prompt_logprobs": 1,
-            "echo": True,
+            # Return the observed prompt token at each position.
+            "prompt_logprobs": 0,
         }
         if with_lora:
             raise NotImplementedError(
@@ -476,9 +475,17 @@ class RemotevLLMEngine(InferenceEngine):
         """Wait for a specified number of requests to complete."""
         return self._engine.wait(count, timeout, raise_timeout)
 
+    def prepare_rollout_result(
+        self, task_id: int, node_addr: str, timeout: float
+    ) -> dict[str, Any] | WorkflowContractFailure | None:
+        return self._engine.prepare_rollout_result(task_id, node_addr, timeout)
+
+    def release_rollout_result(self, task_id: int, discard: bool = False) -> None:
+        self._engine.release_rollout_result(task_id, discard)
+
     def get_rollout_result(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any] | WorkflowContractFailure | None:
         """Transfer the trajectory and quality metrics to the rollout consumer."""
         return self._engine.get_rollout_result(task_id, timeout, raise_timeout)
 

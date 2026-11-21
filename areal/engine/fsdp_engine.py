@@ -769,7 +769,11 @@ class FSDPEngine(TrainEngine):
             list(self.model.parameters()),
             max_norm=self.optimizer_config.gradient_clipping,
             fsdp_group=self.world_mesh["dp_sp"].get_group(),
-            tp_group=self.world_mesh["tp"].get_group(),
+            # A singleton TP reduction can initialize an otherwise unused NCCL
+            # communicator while gradients are resident on the device.
+            tp_group=self.parallel_helper.tp_group
+            if self.parallel_helper.tp_enabled
+            else None,
             offload_params=self.config.fsdp.offload_params,
         )
 
