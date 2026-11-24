@@ -7,13 +7,16 @@ import fcntl
 import json
 import math
 import multiprocessing
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory, TemporaryFile
+from time import monotonic
 from typing import TYPE_CHECKING, Any
+
+from tqdm import tqdm
 
 from areal.api.alloc_mode import ModelAllocation
 from areal.dataset.sft_budget import SFTDataBudget
@@ -120,6 +123,8 @@ async def _generate_split(
     limit: int | None,
     student_tokenizer: "PreTrainedTokenizerBase | None" = None,
     max_length: int | None = None,
+    *,
+    remaining_candidates: Callable[[], int] | None = None,
 ) -> int:
     from areal.dataset.teacher_sft import tokenize_teacher_row
 
@@ -133,7 +138,7 @@ async def _generate_split(
         "spaces_between_special_tokens": False,
     }
 
-    async def generate(prompt: dict, ids: list[int]) -> dict:
+    async def generate(prompt: dict, ids: list[int]) -> tuple[dict, int]:
         result = await engine.async_generate(
             input_ids=ids, sampling_params=sampling, stream=False
         )
@@ -145,15 +150,28 @@ async def _generate_split(
             "response": result["text"],
             "finish_reason": reason["type"],
             "enable_thinking": config.enable_thinking,
-        }
+        }, result["meta_info"].get("completion_tokens", 0)
 
     # Spool results as they finish. Keeping only offsets in RAM lets short
     # requests refill every replica even when an early answer is very long.
     pending: dict[asyncio.Task, int] = {}
     offsets: dict[int, int] = {}
     submitted = 0
+    output_tokens = 0
     exhausted = False
-    with TemporaryFile(dir=path.parent) as spool:
+    total = limit if remaining_candidates is None else remaining_candidates()
+    started = monotonic()
+    with (
+        TemporaryFile(dir=path.parent) as spool,
+        tqdm(
+            total=total,
+            desc=f"Teacher sampling ({path.stem})",
+            unit="sample",
+            dynamic_ncols=True,
+            mininterval=1,
+            miniters=0,
+        ) as progress,
+    ):
         try:
             while True:
                 while (
@@ -168,14 +186,20 @@ async def _generate_split(
                     task = asyncio.create_task(generate(*candidate))
                     pending[task] = submitted
                     submitted += 1
+                if remaining_candidates is not None:
+                    # Full runs discover overlong prompts lazily. Only count
+                    # submitted requests and source rows still to inspect.
+                    progress.total = submitted + remaining_candidates()
                 if not pending:
                     break
                 done, _ = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )
+                previous_rows = len(offsets)
                 for task in done:
                     index = pending.pop(task)
-                    row = task.result()
+                    row, tokens = task.result()
+                    output_tokens += tokens
                     if student_tokenizer is not None and max_length is not None:
                         ids = tokenize_teacher_row(row, student_tokenizer)["input_ids"]
                         if len(ids) > max_length:
@@ -184,6 +208,13 @@ async def _generate_split(
                     spool.write(
                         (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
                     )
+                status = f"requests done={submitted - len(pending)}"
+                if output_tokens:
+                    status += (
+                        f", {output_tokens / (monotonic() - started):,.0f} output tok/s"
+                    )
+                progress.set_postfix_str(status, refresh=False)
+                progress.update(len(offsets) - previous_rows)
         finally:
             for task in pending:
                 task.cancel()
@@ -251,8 +282,12 @@ def _write_teacher_traces(
             )
         student = load_hf_tokenizer(tokenizer_path)
 
+    remaining = len(source)
+
     def eligible_prompts() -> Iterator[tuple[dict, list[int]]]:
+        nonlocal remaining
         for example in source:
+            remaining -= 1
             prompt = (
                 format_dapo_math_prompt(example)
                 if config.uses_dapo_prompts
@@ -297,6 +332,7 @@ def _write_teacher_traces(
                 limit,
                 student,
                 max_length,
+                remaining_candidates=(lambda: remaining) if limit is None else None,
             )
             if count == 0:
                 raise ValueError(

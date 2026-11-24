@@ -16,6 +16,12 @@ driver submits tokenized chat prompts directly to SGLang and keeps up to
 recipe). It saves the generated answers, releases the teacher GPUs, then starts
 Qwen2.5-1.5B-Instruct student SFT using `actor.backend`.
 
+The teacher displays a progress bar for each split. The counter tracks retained samples,
+and `requests done` includes completions rejected by the student length filter.
+`output tok/s` is the average output token rate across all replicas, measured from
+completed requests since that split started. During full training-split generation, the
+progress bar adjusts its total as it discovers overlong prompts.
+
 The teacher draws validation prompts from the source training split using
 `teacher_generation.seed`. The holdout is fixed across training-step budgets. The
 official GSM8K test split remains available for final evaluation.
