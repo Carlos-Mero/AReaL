@@ -13,25 +13,35 @@ def get_dapo_math_17k_rl_dataset(
     tokenizer,
     max_length: int | None = None,
 ) -> Dataset:
-    """Load DAPO-Math-17k from the Hugging Face Hub or a local directory."""
+    """Load DAPO-Math-17k from the Hub, a local directory, or a single data file."""
     dataset_root = Path(path)
     parquet_files = sorted((dataset_root / "data").glob("*.parquet"))
     json_files = sorted(dataset_root.glob("*.jsonl")) + sorted(
         dataset_root.glob("*.json")
     )
-    if parquet_files:
+    if dataset_root.is_file():
+        loaders = {".parquet": "parquet", ".jsonl": "json", ".json": "json"}
+        loader = loaders.get(dataset_root.suffix.lower())
+        if loader is None:
+            raise ValueError(f"Unsupported DAPO data file: {dataset_root}")
+        dataset = load_dataset(
+            loader, data_files=str(dataset_root), split=split or "train"
+        )
+    elif parquet_files:
         dataset = load_dataset(
             "parquet",
             data_files=[str(data_file) for data_file in parquet_files],
             split="train",
         )
+    elif any(dataset_root.glob("*.parquet")):
+        dataset = load_dataset(path, split=split or "train")
     elif json_files:
         dataset = load_dataset(
             "json",
             data_files=[str(data_file) for data_file in json_files],
             split="train",
         )
-    elif path == "BytedTsinghua-SIA/DAPO-Math-17k" and not dataset_root.exists():
+    elif not dataset_root.exists() and not dataset_root.is_absolute():
         dataset = load_dataset(path, split=split or "train")
     else:
         raise FileNotFoundError(

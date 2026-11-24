@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepare reusable GSM8K teacher completions before allocating the SFT actor."""
+"""Prepare reusable math teacher completions before allocating the SFT actor."""
 
 import fcntl
 import json
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class TeacherGenerationConfig:
-    """Offline generation settings. The validation set is held out of GSM8K train."""
+    """Offline generation settings. Validation questions are held out of train."""
 
     model: str = ""
     dataset_path: str = "openai/gsm8k"
@@ -34,6 +34,7 @@ class TeacherGenerationConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     enable_thinking: bool = False
+    dataset_format: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -42,6 +43,10 @@ class TeacherGenerationConfig:
             raise ValueError("Teacher batch size and length limits must be positive")
         if self.validation_size < 0:
             raise ValueError("Teacher validation size must be non-negative")
+        if self.dataset_format not in (None, "gsm8k", "dapo"):
+            raise ValueError(
+                "teacher_generation.dataset_format must be gsm8k, dapo, or null"
+            )
         if (
             not math.isfinite(self.temperature)
             or self.temperature < 0
@@ -50,6 +55,12 @@ class TeacherGenerationConfig:
             raise ValueError(
                 "Teacher sampling requires temperature >= 0 and 0 < top_p <= 1"
             )
+
+    @property
+    def uses_dapo_prompts(self) -> bool:
+        if self.dataset_format is not None:
+            return self.dataset_format == "dapo"
+        return "dapo" in self.dataset_path.lower()
 
 
 def _decode_completion(
@@ -67,11 +78,17 @@ def _write_teacher_traces(config: TeacherGenerationConfig, output: Path) -> None
     import torch
     from transformers import AutoModelForCausalLM, GenerationConfig, set_seed
 
+    from areal.dataset.dapo_math_17k import get_dapo_math_17k_rl_dataset
     from areal.dataset.gsm8k import get_gsm8k_rl_dataset
     from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 
     tokenizer = load_hf_tokenizer(config.model, padding_side="left")
-    prompts = get_gsm8k_rl_dataset(
+    load_prompts = (
+        get_dapo_math_17k_rl_dataset
+        if config.uses_dapo_prompts
+        else get_gsm8k_rl_dataset
+    )
+    prompts = load_prompts(
         config.dataset_path, "train", tokenizer, max_length=config.max_prompt_length
     )
     splits = {"train": prompts}
@@ -144,7 +161,13 @@ def _write_teacher_traces(config: TeacherGenerationConfig, output: Path) -> None
 
 def prepare_teacher_traces(config: TeacherGenerationConfig, output: Path) -> None:
     """Publish both splits together. Concurrent runs on shared storage reuse one copy."""
-    manifest = {"format_version": 1, "teacher_generation": asdict(config)}
+    settings = asdict(config)
+    if config.uses_dapo_prompts:
+        settings["dataset_format"] = "dapo"
+    else:
+        # Older manifests implicitly used the GSM8K loader.
+        settings.pop("dataset_format")
+    manifest = {"format_version": 1, "teacher_generation": settings}
     splits = ("train", "validation") if config.validation_size else ("train",)
     output.parent.mkdir(parents=True, exist_ok=True)
     with (output.parent / f".{output.name}.lock").open("a") as lock:

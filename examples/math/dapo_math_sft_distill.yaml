@@ -1,0 +1,11 @@
+defaults:
+  - gsm8k_sft_distill
+  - _self_
+
+experiment_name: dapo-math-sft-distill
+teacher_generation:
+  dataset_path: ${oc.env:DAPO_MATH_17K_PATH,BytedTsinghua-SIA/DAPO-Math-17k}
+  dataset_format: dapo
+
+train_dataset:
+  path: ${cluster.fileroot}/datasets/dapo-math-teacher-traces

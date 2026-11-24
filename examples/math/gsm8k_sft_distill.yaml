@@ -18,6 +18,7 @@ scheduler:
 teacher_generation:
   model: Qwen/Qwen3-14B
   dataset_path: openai/gsm8k
+  dataset_format: null  # Infer from the path, or set gsm8k / dapo explicitly.
   seed: 1
   validation_size: 256
   batch_size: 256

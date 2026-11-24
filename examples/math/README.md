@@ -46,6 +46,20 @@ To train on the full GSM8K training split used by the RL recipe, set
 `teacher_generation.validation_size=0 valid_dataset=null` and choose a fresh data
 directory.
 
+For DAPO-Math-17k, use the same entry point with the DAPO recipe. It loads the
+source's `train` split, uses its chat prompts and maps `label` or
+`reward_model.ground_truth` to the scoring reference. The teacher supplies the SFT
+targets. The recipe holds out 256 training examples by default.
+
+```bash
+python3 examples/math/gsm8k_sft.py --config examples/math/dapo_math_sft_distill.yaml
+```
+
+Set `DAPO_MATH_17K_PATH` to use a local mirror or a single Parquet or JSONL file.
+To use every eligible training example, add
+`teacher_generation.validation_size=0 valid_dataset=null`. When comparing against a
+previous run with a different split, set a new `train_dataset.path` for its traces.
+
 ## Hyper-parameters for GSM8K Finetuning on Qwen2.5-1.5b-Instruct
 
 `gsm8k_grpo.yaml` uses `6e-6`, retuned for the current FSDP FP32-master optimizer path.
