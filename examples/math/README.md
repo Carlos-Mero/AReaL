@@ -1,8 +1,10 @@
 ## GSM8K supervised distillation
 
 Run the existing SFT entry point with the teacher-trace recipe from the repository root.
-The default output directory is `$PWD/experiments`. Set `AREAL_FILEROOT` to choose a
-shared directory when the driver and data workers run on different hosts.
+The teacher writes samples to `./datasets/<experiment_name>/<trial_name>/` under the
+launch directory. The student reads `train.jsonl` and, when validation is enabled,
+`validation.jsonl` from that directory. Training logs and checkpoints use
+`AREAL_FILEROOT`, which defaults to `$PWD/experiments`.
 
 ```bash
 python3 examples/math/gsm8k_sft.py --config examples/math/gsm8k_sft_distill.yaml
@@ -15,6 +17,12 @@ driver submits tokenized chat prompts directly to SGLang and keeps up to
 `teacher_generation.batch_size` requests in flight across all replicas (256 in this
 recipe). It saves the generated answers, releases the teacher GPUs, then starts
 Qwen2.5-1.5B-Instruct student SFT using `actor.backend`.
+
+The distillation recipes set `train_dataset.num_workers=0` and
+`valid_dataset.num_workers=0` so the student builds batches in the process that
+consumes them. With worker subprocesses, passing a batch of per-sample tensors through the
+queue can exhaust the Linux file descriptor limit (`Too many open files`). You can
+apply these two overrides to an existing recipe and reuse its completed teacher traces.
 
 The teacher displays a progress bar for each split. The counter tracks retained samples,
 and `requests done` includes completions rejected by the student length filter.
@@ -37,16 +45,19 @@ responses plus the configured validation holdout. The trainer logs the final ste
 after filtering and uses it for the learning rate schedule. `total_train_steps=null`
 prepares the full training split.
 
-Subsequent runs reuse the teacher responses at `train_dataset.path`. For example, use
-the same data to compare two student learning rates by setting a new trial name:
+Repeating a trial reuses compatible teacher responses in its directory. To compare
+learning rates across trials using the same samples, point the new trial at the
+first trial's directory.
 
 ```bash
 python3 examples/math/gsm8k_sft.py --config examples/math/gsm8k_sft_distill.yaml \
-  trial_name=lr1e5 actor.optimizer.lr=1e-5 total_train_epochs=2
+  trial_name=lr1e5 train_dataset.path=./datasets/gsm8k-sft-distill/baseline \
+  actor.optimizer.lr=1e-5 total_train_epochs=2
 ```
 
-To prepare the data on a separate accelerator host, pass `prepare_only=true` and then
-launch training on the shared directory. Set a new `train_dataset.path` when changing
+To prepare the data on a separate accelerator host, pass `prepare_only=true` and set
+`train_dataset.path` to the same absolute shared directory for preparation and training.
+Set a new `train_dataset.path` when changing
 the teacher, its sampling settings, or its checkpoint contents. A full compatible cache
 can serve a short run, and a capped cache can serve a smaller compatible budget. Choose
 a fresh directory to increase the budget beyond a capped cache. The recipes use separate

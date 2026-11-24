@@ -34,12 +34,15 @@ actor:
   disable_dropout: true
 
 train_dataset:
-  path: ${cluster.fileroot}/datasets/gsm8k-sglang-teacher-traces
+  path: ./datasets/${experiment_name}/${trial_name}
   type: teacher_sft
   split: train
   max_length: 9216
+  # Collate tokenized traces locally to avoid one shared-memory FD per tensor.
+  num_workers: 0
 valid_dataset:
   path: ${train_dataset.path}
   type: teacher_sft
   split: validation
   max_length: ${train_dataset.max_length}
+  num_workers: 0
