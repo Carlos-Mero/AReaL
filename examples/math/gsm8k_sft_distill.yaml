@@ -1,0 +1,41 @@
+# Offline teacher demonstrations + student SFT, using the standard AReaL SFT actor.
+defaults:
+  - gsm8k_sft
+  - _self_
+
+experiment_name: gsm8k-sft-distill
+trial_name: baseline
+prepare_only: false
+total_train_steps: null
+
+cluster:
+  fileroot: ${oc.env:AREAL_FILEROOT,${oc.env:PWD}/experiments}
+  name_resolve:
+    nfs_record_root: ${cluster.fileroot}/name_resolve
+scheduler:
+  type: local
+
+teacher_generation:
+  model: Qwen/Qwen3-14B
+  dataset_path: openai/gsm8k
+  seed: 1
+  validation_size: 256
+  batch_size: 256
+  max_prompt_length: 1024
+  max_new_tokens: 8192
+  enable_thinking: false
+
+actor:
+  path: Qwen/Qwen2.5-1.5B-Instruct
+  disable_dropout: true
+
+train_dataset:
+  path: ${cluster.fileroot}/datasets/gsm8k-teacher-traces
+  type: teacher_sft
+  split: train
+  max_length: 9216
+valid_dataset:
+  path: ${train_dataset.path}
+  type: teacher_sft
+  split: validation
+  max_length: ${train_dataset.max_length}

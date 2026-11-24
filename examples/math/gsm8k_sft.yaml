@@ -4,15 +4,16 @@ trial_name: trial0
 seed: 1
 enable_offload: false
 total_train_epochs: 1
+total_train_steps: 400
 tokenizer_path: ${actor.path}
 
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /tmp/areal/experiments
+  fileroot: ./tmp/areal/experiments
   name_resolve:
     type: nfs
-    nfs_record_root: /tmp/areal/name_resolve
+    nfs_record_root: ./tmp/areal/name_resolve
 
 
 scheduler:
@@ -30,13 +31,14 @@ actor:
     max_tokens_per_mb: 4096
   optimizer:
     type: adam
-    lr: 2e-5
-    weight_decay: 0.05
+    lr: 6.00e-6
+    weight_decay: 0.000
     beta1: 0.9
-    beta2: 0.95
-    eps: 1e-5
-    lr_scheduler_type: cosine
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: constant
     gradient_clipping: 1.0
+    warmup_steps_proportion: 0.001
   scheduling_spec:
     - task_type: worker
       port_count: 2
@@ -46,7 +48,7 @@ actor:
       env_vars: {}
 
 train_dataset:
-  batch_size: 128
+  batch_size: 256
   shuffle: true
   pin_memory: true
   num_workers: 4
@@ -54,7 +56,7 @@ train_dataset:
   type: sft
 
 valid_dataset:
-  batch_size: 128
+  batch_size: 256
   pin_memory: true
   num_workers: 4
   path: openai/gsm8k
@@ -65,7 +67,7 @@ saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
+  freq_epochs: null
   freq_steps: null
   freq_secs: null
 
@@ -74,7 +76,7 @@ recover:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
+  freq_epochs: null
   freq_steps: null
   freq_secs: 3600
 
@@ -82,7 +84,7 @@ evaluator:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
+  freq_epochs: null
   freq_steps: null
   freq_secs: null
 

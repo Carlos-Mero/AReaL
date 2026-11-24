@@ -1,3 +1,51 @@
+## GSM8K supervised distillation
+
+Run the existing SFT entry point with the teacher-trace recipe from the repository root.
+The default output directory is `$PWD/experiments`. Set `AREAL_FILEROOT` to choose a
+shared directory when the driver and data workers run on different hosts.
+
+```bash
+python3 examples/math/gsm8k_sft.py --config examples/math/gsm8k_sft_distill.yaml
+```
+
+The first run uses Transformers to generate one Qwen3-14B response per training
+question using the GSM8K RL prompt. It holds out 256 training questions for validation
+and leaves the official test split for final evaluation. Generation runs in a child
+process on the driver with `device_map="auto"`. After that process exits, the standard
+SFT trainer trains Qwen3-0.6B, evaluates response-token loss and saves Hugging Face
+checkpoints beneath `cluster.fileroot/checkpoints`. The example inherits the local
+eight-GPU FSDP allocation from the GSM8K SFT recipe. Adjust `actor.backend` and
+`cluster.n_gpus_per_node` for the student hardware.
+
+Subsequent runs reuse the teacher responses at `train_dataset.path`. For example, use
+the same data to compare two student learning rates by setting a new trial name:
+
+```bash
+python3 examples/math/gsm8k_sft.py --config examples/math/gsm8k_sft_distill.yaml \
+  trial_name=lr1e5 actor.optimizer.lr=1e-5 total_train_epochs=2
+```
+
+To prepare the data on a separate accelerator host, pass `prepare_only=true` and then
+launch training on the shared directory. Set a new `train_dataset.path` when changing
+the teacher, its sampling settings, or its checkpoint contents. For existing teacher
+data, set `teacher_generation=null` and point `train_dataset.path` at a directory with
+`train.jsonl` and `validation.jsonl`. Each line contains a prompt and the raw teacher
+continuation, without the terminal stop marker:
+
+```json
+{"messages":[{"role":"user","content":"What is 2 + 2?"}],"response":"The answer is 4.","finish_reason":"stop","enable_thinking":false}
+```
+
+The loader masks the student chat prompt, including the assistant generation prefix.
+It supervises the response and includes the student EOS for `stop` completions.
+`length` marks a truncated completion and trains on the available tokens. The
+generated JSONL also retains the reference `answer` for scoring. Use the same prompts,
+thinking mode and generation evaluator for SFT and OPD task accuracy. The independent
+GSM8K evaluator in `examples/math/gsm8k_eval.py` disables thinking by default.
+To train on the full GSM8K training split used by the RL recipe, set
+`teacher_generation.validation_size=0 valid_dataset=null` and choose a fresh data
+directory.
+
 ## Hyper-parameters for GSM8K Finetuning on Qwen2.5-1.5b-Instruct
 
 `gsm8k_grpo.yaml` uses `6e-6`, retuned for the current FSDP FP32-master optimizer path.

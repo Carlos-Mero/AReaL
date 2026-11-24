@@ -32,6 +32,7 @@ VALID_DATASETS = [
     "torl_data",
     "dapo-math-17k",
     "swe_sft",
+    "teacher_sft",
 ]
 
 logger = logging.getLogger("Dataset")
@@ -75,6 +76,12 @@ def _get_custom_dataset(
     data_worker_cache_attempt_id: str | None = None,
     **kwargs,
 ) -> "Dataset":
+    if type == "teacher_sft":
+        from .teacher_sft import get_teacher_sft_dataset
+
+        return get_teacher_sft_dataset(
+            path=path, split=split, tokenizer=tokenizer, max_length=max_length, **kwargs
+        )
     if "gsm8k" in path and type == "sft":
         from .gsm8k import get_gsm8k_sft_dataset
 
