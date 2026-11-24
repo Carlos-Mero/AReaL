@@ -1,22 +1,14 @@
 import sys
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from areal import SFTTrainer
-from areal.api.cli_args import SFTConfig, load_expr_config
+from areal.api.cli_args import load_expr_config
 from areal.dataset import get_custom_dataset, is_dapo_math_17k_path
-from areal.dataset.gsm8k_teacher import TeacherGenerationConfig, prepare_teacher_traces
+from areal.dataset.gsm8k_teacher import GSM8KSFTConfig, prepare_teacher_traces
 from areal.dataset.sft_budget import SFTDataBudget
 from areal.utils import logging
 from areal.utils.hf_utils import load_hf_tokenizer
-
-
-@dataclass
-class GSM8KSFTConfig(SFTConfig):
-    """Optionally prepare a fixed set of teacher demonstrations before student SFT."""
-
-    teacher_generation: TeacherGenerationConfig | None = None
-    prepare_only: bool = False
 
 
 def main(args: list[str]) -> None:

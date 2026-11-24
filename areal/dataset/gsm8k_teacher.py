@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from tqdm import tqdm
 
 from areal.api.alloc_mode import ModelAllocation
+from areal.api.cli_args import SFTConfig
 from areal.dataset.sft_budget import SFTDataBudget
 from areal.utils import logging
 
@@ -91,6 +92,14 @@ class TeacherGenerationConfig:
         if self.dataset_format is not None:
             return self.dataset_format == "dapo"
         return "dapo" in self.dataset_path.lower()
+
+
+@dataclass
+class GSM8KSFTConfig(SFTConfig):
+    """Math SFT experiment config shared by the driver and RPC workers."""
+
+    teacher_generation: TeacherGenerationConfig | None = None
+    prepare_only: bool = False
 
 
 def _create_teacher_engine(config: TeacherGenerationConfig) -> "Engine":
