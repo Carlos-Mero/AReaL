@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
     from areal.infra.data_service.rdataset import RDataset
 
+_DAPO_MATH_NAMES = ("dapo-math-17k", "dapo-math-unique-17k")
+
 VALID_DATASETS = [
     "gsm8k",
     "clevr_count_70k",
@@ -30,7 +32,7 @@ VALID_DATASETS = [
     "virl39k",
     "hh-rlhf",
     "torl_data",
-    "dapo-math-17k",
+    *_DAPO_MATH_NAMES,
     "swe_sft",
     "teacher_sft",
 ]
@@ -45,6 +47,11 @@ _SWE_PATH_PATTERN = re.compile(r"(?:^|[/_\-.])swe(?:[/_\-.]|$)")
 _SWE_SFT_ARTIFACT_MARKER = ".areal_swe_sft.json"
 _SWE_SFT_ARTIFACT_FORMAT = "areal.swe_sft.pretokenized"
 _SWE_SFT_ARTIFACT_VERSION = 1
+
+
+def is_dapo_math_17k_path(path: str) -> bool:
+    normalized = path.lower().replace("_", "-")
+    return any(name in normalized for name in _DAPO_MATH_NAMES)
 
 
 def _is_swe_sft_artifact(path: str) -> bool:
@@ -182,10 +189,18 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
-    elif "dapo-math-17k" in path.lower() and type == "rl":
-        from .dapo_math_17k import get_dapo_math_17k_rl_dataset
+    elif type in ("rl", "sft") and is_dapo_math_17k_path(path):
+        from .dapo_math_17k import (
+            get_dapo_math_17k_rl_dataset,
+            get_dapo_math_17k_sft_dataset,
+        )
 
-        return get_dapo_math_17k_rl_dataset(
+        loader = (
+            get_dapo_math_17k_rl_dataset
+            if type == "rl"
+            else get_dapo_math_17k_sft_dataset
+        )
+        return loader(
             path=path,
             split=split,
             tokenizer=tokenizer,
@@ -308,4 +323,5 @@ __all__ = [
     "get_custom_dataset",
     "get_mopd_dataset",
     "get_routed_dataset",
+    "is_dapo_math_17k_path",
 ]

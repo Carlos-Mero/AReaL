@@ -88,7 +88,7 @@ class SFTDataBudget:
 
 def prepare_sft_dataset(
     dataset: Dataset,
-    tokenize: Callable,
+    tokenize: Callable | None,
     max_length: int | None,
     training_budget: dict | None,
     remove_columns: list[str] | None = None,
@@ -96,12 +96,13 @@ def prepare_sft_dataset(
     """Tokenize only enough candidate rows to fill a sub-epoch training run."""
 
     def process(rows: Dataset) -> Dataset:
-        rows = rows.map(
-            tokenize,
-            remove_columns=rows.column_names
-            if remove_columns is None
-            else remove_columns,
-        )
+        if tokenize is not None:
+            rows = rows.map(
+                tokenize,
+                remove_columns=rows.column_names
+                if remove_columns is None
+                else remove_columns,
+            )
         if max_length is not None:
             rows = rows.filter(lambda row: len(row["input_ids"]) <= max_length)
         return rows

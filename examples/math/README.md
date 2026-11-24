@@ -70,10 +70,21 @@ training split used by the RL recipe, set
 `teacher_generation.validation_size=0 valid_dataset=null` and choose a fresh data
 directory.
 
-For DAPO-Math-17k, use the same entry point with the DAPO recipe. It loads the source's
-`train` split, uses its chat prompts and maps `label` or `reward_model.ground_truth` to
-the scoring reference. The teacher supplies the SFT targets. The recipe holds out 256
-training examples by default.
+The DAPO recipe defaults to `tongyx361/DAPO-Math-Unique-17k`. It reads the `train` split
+and uses its chat prompts for teacher generation. The teacher supplies the SFT targets,
+and `label` or `reward_model.ground_truth` supplies the scoring reference. The recipe
+holds out 256 prompts for validation and caps student training at 400 steps. With the
+inherited global batch size of 256 and one epoch, the full deduplicated split fits
+within that budget. With `train_dataset.batch_size=32`, 400 steps target 12,800 usable
+training examples.
+[Deduplicated dataset](https://huggingface.co/datasets/tongyx361/DAPO-Math-Unique-17k)
+
+The shared dataset loader also accepts this Hub ID for `train_dataset.path`. With
+`type: rl`, it returns the original chat messages and a reference answer for scoring.
+With `type: sft`, the student learns the reference answer and EOS. The distillation
+recipe below uses `teacher_sft` to train on teacher-generated solutions. The Hub dataset
+provides a single `train` split. For RL, set `valid_dataset=null` or configure a
+separate evaluation set.
 
 ```bash
 python3 examples/math/gsm8k_sft.py --config examples/math/dapo_math_sft_distill.yaml
@@ -81,8 +92,9 @@ python3 examples/math/gsm8k_sft.py --config examples/math/dapo_math_sft_distill.
 
 Set `DAPO_MATH_17K_PATH` to use a local mirror or a single Parquet or JSONL file. To use
 every eligible training example, add
-`teacher_generation.validation_size=0 valid_dataset=null`. When comparing against a
-previous run with a different split, set a new `train_dataset.path` for its traces.
+`total_train_steps=null teacher_generation.validation_size=0 valid_dataset=null`. When
+comparing against a previous run with a different split, set a new `train_dataset.path`
+for its traces.
 
 ## Hyper-parameters for GSM8K Finetuning on Qwen2.5-1.5b-Instruct
 

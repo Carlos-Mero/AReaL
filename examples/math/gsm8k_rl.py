@@ -11,15 +11,17 @@ def main(args):
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 
     train_dataset = get_custom_dataset(
-        split="train",
+        split=config.train_dataset.split,
         dataset_config=config.train_dataset,
         tokenizer=tokenizer,
     )
-    valid_dataset = get_custom_dataset(
-        split="test",
-        dataset_config=config.valid_dataset,
-        tokenizer=tokenizer,
-    )
+    valid_dataset = None
+    if config.valid_dataset is not None:
+        valid_dataset = get_custom_dataset(
+            split=config.valid_dataset.split,
+            dataset_config=config.valid_dataset,
+            tokenizer=tokenizer,
+        )
 
     workflow_kwargs = dict(
         temperature=config.gconfig.temperature,

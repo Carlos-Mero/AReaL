@@ -4,7 +4,7 @@ from pathlib import Path
 
 from areal import SFTTrainer
 from areal.api.cli_args import SFTConfig, load_expr_config
-from areal.dataset import get_custom_dataset
+from areal.dataset import get_custom_dataset, is_dapo_math_17k_path
 from areal.dataset.gsm8k_teacher import TeacherGenerationConfig, prepare_teacher_traces
 from areal.dataset.sft_budget import SFTDataBudget
 from areal.utils import logging
@@ -60,11 +60,12 @@ def main(args: list[str]) -> None:
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 
     loader_kwargs = {}
+    train_path = config.train_dataset.path or ""
     if budget is not None and (
         config.train_dataset.type == "teacher_sft"
         or (
             config.train_dataset.type == "sft"
-            and "gsm8k" in (config.train_dataset.path or "")
+            and ("gsm8k" in train_path or is_dapo_math_17k_path(train_path))
         )
     ):
         loader_kwargs["training_budget"] = asdict(budget)

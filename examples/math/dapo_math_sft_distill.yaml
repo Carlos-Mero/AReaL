@@ -3,9 +3,10 @@ defaults:
   - _self_
 
 experiment_name: dapo-math-sft-distill
+total_train_steps: 400
 teacher_generation:
-  dataset_path: ${oc.env:DAPO_MATH_17K_PATH,BytedTsinghua-SIA/DAPO-Math-17k}
+  dataset_path: ${oc.env:DAPO_MATH_17K_PATH,tongyx361/DAPO-Math-Unique-17k}
   dataset_format: dapo
 
 train_dataset:
-  path: ${cluster.fileroot}/datasets/dapo-math-sglang-teacher-traces
+  path: ${cluster.fileroot}/datasets/dapo-math-unique-sglang-teacher-traces
