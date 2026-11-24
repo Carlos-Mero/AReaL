@@ -141,11 +141,14 @@ class FinetuneSpec:
     total_train_epochs: int
     dataset_size: int
     train_batch_size: int
+    max_train_steps: int | None = None
 
     @property
     def total_train_steps(self):
-        # assuming drop_last
-        return self.total_train_epochs * (self.dataset_size // self.train_batch_size)
+        steps = self.total_train_epochs * self.steps_per_epoch
+        return (
+            steps if self.max_train_steps is None else min(steps, self.max_train_steps)
+        )
 
     @property
     def steps_per_epoch(self):

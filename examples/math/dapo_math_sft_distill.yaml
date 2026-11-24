@@ -8,4 +8,4 @@ teacher_generation:
   dataset_format: dapo
 
 train_dataset:
-  path: ${cluster.fileroot}/datasets/dapo-math-teacher-traces
+  path: ${cluster.fileroot}/datasets/dapo-math-sglang-teacher-traces

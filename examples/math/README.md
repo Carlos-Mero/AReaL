@@ -8,14 +8,28 @@ shared directory when the driver and data workers run on different hosts.
 python3 examples/math/gsm8k_sft.py --config examples/math/gsm8k_sft_distill.yaml
 ```
 
-The first run uses Transformers to generate one Qwen3-14B response per training
-question using the GSM8K RL prompt. It holds out 256 training questions for validation
-and leaves the official test split for final evaluation. Generation runs in a child
-process on the driver with `device_map="auto"`. After that process exits, the standard
-SFT trainer trains Qwen3-0.6B, evaluates response-token loss and saves Hugging Face
-checkpoints beneath `cluster.fileroot/checkpoints`. The example inherits the local
-eight-GPU FSDP allocation from the GSM8K SFT recipe. Adjust `actor.backend` and
-`cluster.n_gpus_per_node` for the student hardware.
+The first run launches an offline SGLang teacher on the driver node. The default
+`teacher_generation.backend=sglang:d8p1t1` gives each of eight visible GPUs its own
+Qwen3-14B replica. The same node can run four two-GPU replicas with `sglang:d4p1t2`. The
+driver submits tokenized chat prompts directly to SGLang and keeps up to
+`teacher_generation.batch_size` requests in flight across all replicas (256 in this
+recipe). It saves the generated answers, releases the teacher GPUs, then starts
+Qwen2.5-1.5B-Instruct student SFT using `actor.backend`.
+
+The teacher draws validation prompts from the source training split using
+`teacher_generation.seed`. The holdout is fixed across training-step budgets. The
+official GSM8K test split remains available for final evaluation.
+
+With an explicit `total_train_steps`, the math SFT entry point logs the estimated steps
+per epoch immediately after loading the source. If the requested steps fit strictly
+inside one epoch, preparation stops at the requested steps times the student's global
+`train_dataset.batch_size` (rounded up for sampler sharding when needed). Prompt-length
+rejections cost no teacher requests. Generated answers that exceed the student length
+limit are replaced until the budget is met or the source runs out. Validation has its
+own budget. For example, ten steps at batch size 256 require 2,560 usable training
+responses plus the configured validation holdout. The trainer logs the final step count
+after filtering and uses it for the learning rate schedule. `total_train_steps=null`
+prepares the full training split.
 
 Subsequent runs reuse the teacher responses at `train_dataset.path`. For example, use
 the same data to compare two student learning rates by setting a new trial name:
@@ -27,36 +41,40 @@ python3 examples/math/gsm8k_sft.py --config examples/math/gsm8k_sft_distill.yaml
 
 To prepare the data on a separate accelerator host, pass `prepare_only=true` and then
 launch training on the shared directory. Set a new `train_dataset.path` when changing
-the teacher, its sampling settings, or its checkpoint contents. For existing teacher
-data, set `teacher_generation=null` and point `train_dataset.path` at a directory with
-`train.jsonl` and `validation.jsonl`. Each line contains a prompt and the raw teacher
-continuation, without the terminal stop marker:
+the teacher, its sampling settings, or its checkpoint contents. A full compatible cache
+can serve a short run, and a capped cache can serve a smaller compatible budget. Choose
+a fresh directory to increase the budget beyond a capped cache. The recipes use separate
+default directories for the SGLang traces. To explicitly train on traces from the
+previous Transformers generator or other teacher data, set `teacher_generation=null` and
+point `train_dataset.path` at a directory with `train.jsonl` and `validation.jsonl`.
+Each line contains a prompt and the raw teacher continuation, without the terminal stop
+marker:
 
 ```json
 {"messages":[{"role":"user","content":"What is 2 + 2?"}],"response":"The answer is 4.","finish_reason":"stop","enable_thinking":false}
 ```
 
-The loader masks the student chat prompt, including the assistant generation prefix.
-It supervises the response and includes the student EOS for `stop` completions.
-`length` marks a truncated completion and trains on the available tokens. The
-generated JSONL also retains the reference `answer` for scoring. Use the same prompts,
-thinking mode and generation evaluator for SFT and OPD task accuracy. The independent
-GSM8K evaluator in `examples/math/gsm8k_eval.py` disables thinking by default.
-To train on the full GSM8K training split used by the RL recipe, set
+The loader masks the student chat prompt, including the assistant generation prefix. It
+supervises the response and includes the student EOS for `stop` completions. `length`
+marks a truncated completion and trains on the available tokens. The generated JSONL
+also retains the reference `answer` for scoring. Use the same prompts, thinking mode and
+generation evaluator for SFT and OPD task accuracy. The independent GSM8K evaluator in
+`examples/math/gsm8k_eval.py` disables thinking by default. To train on the full GSM8K
+training split used by the RL recipe, set
 `teacher_generation.validation_size=0 valid_dataset=null` and choose a fresh data
 directory.
 
-For DAPO-Math-17k, use the same entry point with the DAPO recipe. It loads the
-source's `train` split, uses its chat prompts and maps `label` or
-`reward_model.ground_truth` to the scoring reference. The teacher supplies the SFT
-targets. The recipe holds out 256 training examples by default.
+For DAPO-Math-17k, use the same entry point with the DAPO recipe. It loads the source's
+`train` split, uses its chat prompts and maps `label` or `reward_model.ground_truth` to
+the scoring reference. The teacher supplies the SFT targets. The recipe holds out 256
+training examples by default.
 
 ```bash
 python3 examples/math/gsm8k_sft.py --config examples/math/dapo_math_sft_distill.yaml
 ```
 
-Set `DAPO_MATH_17K_PATH` to use a local mirror or a single Parquet or JSONL file.
-To use every eligible training example, add
+Set `DAPO_MATH_17K_PATH` to use a local mirror or a single Parquet or JSONL file. To use
+every eligible training example, add
 `teacher_generation.validation_size=0 valid_dataset=null`. When comparing against a
 previous run with a different split, set a new `train_dataset.path` for its traces.
 

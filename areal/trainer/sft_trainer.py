@@ -121,6 +121,16 @@ class SFTTrainer:
             total_train_epochs=config.total_train_epochs,
             dataset_size=len(self.train_dataloader) * config.train_dataset.batch_size,
             train_batch_size=config.train_dataset.batch_size,
+            max_train_steps=config.total_train_steps,
+        )
+        self.total_train_steps = ft_spec.total_train_steps
+        logger.info(
+            "SFT training plan after filtering: %d rows, global batch size %d, "
+            "%d steps/epoch, %d total training steps",
+            len(train_dataset),
+            config.train_dataset.batch_size,
+            len(self.train_dataloader),
+            self.total_train_steps,
         )
 
         self.actor.initialize(addr=None, ft_spec=ft_spec, role="actor")
@@ -174,9 +184,7 @@ class SFTTrainer:
             else 0
         )
 
-        total_epochs = config.total_train_epochs
         steps_per_epoch = len(self.train_dataloader)
-        max_steps = total_epochs * steps_per_epoch
 
         global_step = 0
         _restore_sampler_epoch_for_recovery(
@@ -190,12 +198,7 @@ class SFTTrainer:
                 epoch_step=-1,
                 global_step=-1,
             )
-        for global_step in range(start_step, max_steps):
-            if (
-                config.total_train_steps is not None
-                and global_step >= config.total_train_steps
-            ):
-                break
+        for global_step in range(start_step, self.total_train_steps):
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 

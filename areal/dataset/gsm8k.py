@@ -1,6 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
+
+from areal.dataset.sft_budget import prepare_sft_dataset
+
+
+def load_gsm8k_source(path: str, split: str) -> Dataset:
+    return load_dataset(path=path, name="main", split=split)
+
+
+def gsm8k_messages(sample: dict) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": sample["question"]
+            + "\nPlease put your final answer within \\boxed{}.",
+        }
+    ]
 
 
 def get_gsm8k_sft_dataset(
@@ -8,8 +24,9 @@ def get_gsm8k_sft_dataset(
     split: str,
     tokenizer,
     max_length: int | None = None,
+    training_budget: dict | None = None,
 ):
-    dataset = load_dataset(path=path, name="main", split=split)
+    dataset = load_gsm8k_source(path, split)
 
     def process(sample):
         seq_token = tokenizer.encode(
@@ -19,13 +36,13 @@ def get_gsm8k_sft_dataset(
         loss_mask = [0] * len(prompt_token) + [1] * (len(seq_token) - len(prompt_token))
         return {"input_ids": seq_token, "loss_mask": loss_mask}
 
-    dataset = dataset.map(process).remove_columns(["question", "answer"])
-
-    if max_length is not None:
-        # Filter out sequences longer than max_length
-        dataset = dataset.filter(lambda x: len(x["input_ids"]) <= max_length)
-
-    return dataset
+    return prepare_sft_dataset(
+        dataset,
+        process,
+        max_length,
+        training_budget,
+        remove_columns=["question", "answer"],
+    )
 
 
 def get_gsm8k_rl_dataset(
@@ -34,17 +51,10 @@ def get_gsm8k_rl_dataset(
     tokenizer,
     max_length: int | None = None,
 ):
-    dataset = load_dataset(path=path, name="main", split=split)
+    dataset = load_gsm8k_source(path, split)
 
     def process(sample):
-        messages = [
-            {
-                "role": "user",
-                "content": sample["question"]
-                + "\nPlease put your final answer within \\boxed{}.",
-            }
-        ]
-        return {"messages": messages}
+        return {"messages": gsm8k_messages(sample)}
 
     dataset = dataset.map(process).remove_columns(["question"])
 

@@ -7,12 +7,7 @@ from datasets import Dataset, load_dataset
 from areal.utils.hf_utils import apply_chat_template
 
 
-def get_dapo_math_17k_rl_dataset(
-    path: str,
-    split: str | None,
-    tokenizer,
-    max_length: int | None = None,
-) -> Dataset:
+def load_dapo_math_17k_source(path: str, split: str | None) -> Dataset:
     """Load DAPO-Math-17k from the Hub, a local directory, or a single data file."""
     dataset_root = Path(path)
     parquet_files = sorted((dataset_root / "data").glob("*.parquet"))
@@ -48,13 +43,24 @@ def get_dapo_math_17k_rl_dataset(
             f"No parquet or JSON data files found under {dataset_root}"
         )
 
-    def process(sample):
-        answer = sample.get("label")
-        if answer is None:
-            answer = sample["reward_model"]["ground_truth"]
-        return {"messages": sample["prompt"], "answer": str(answer)}
+    return dataset
 
-    dataset = dataset.map(process, remove_columns=dataset.column_names)
+
+def format_dapo_math_prompt(sample: dict) -> dict:
+    answer = sample.get("label")
+    if answer is None:
+        answer = sample["reward_model"]["ground_truth"]
+    return {"messages": sample["prompt"], "answer": str(answer)}
+
+
+def get_dapo_math_17k_rl_dataset(
+    path: str,
+    split: str | None,
+    tokenizer,
+    max_length: int | None = None,
+) -> Dataset:
+    dataset = load_dapo_math_17k_source(path, split)
+    dataset = dataset.map(format_dapo_math_prompt, remove_columns=dataset.column_names)
 
     if max_length is not None:
         if tokenizer is None:

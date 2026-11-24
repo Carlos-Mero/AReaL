@@ -17,11 +17,14 @@ scheduler:
 
 teacher_generation:
   model: Qwen/Qwen3-14B
+  backend: sglang:d8p1t1
   dataset_path: openai/gsm8k
   dataset_format: null  # Infer from the path, or set gsm8k / dapo explicitly.
   seed: 1
   validation_size: 256
-  batch_size: 256
+  batch_size: 256  # Maximum in-flight prompts across all teacher replicas.
+  mem_fraction_static: null
+  max_running_requests: null
   max_prompt_length: 1024
   max_new_tokens: 8192
   enable_thinking: false
@@ -31,7 +34,7 @@ actor:
   disable_dropout: true
 
 train_dataset:
-  path: ${cluster.fileroot}/datasets/gsm8k-teacher-traces
+  path: ${cluster.fileroot}/datasets/gsm8k-sglang-teacher-traces
   type: teacher_sft
   split: train
   max_length: 9216
